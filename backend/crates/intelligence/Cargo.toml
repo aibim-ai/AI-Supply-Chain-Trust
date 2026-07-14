@@ -1,0 +1,20 @@
+[package]
+name = "ai-supply-chain-trust-intelligence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-supply-chain-trust-llm = { path = "../llm" }
+ai-supply-chain-trust-models = { path = "../models" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+url.workspace = true
+base64.workspace = true
+toml.workspace = true
+chrono.workspace = true

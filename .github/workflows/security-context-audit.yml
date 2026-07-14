@@ -1,0 +1,31 @@
+name: Security Context Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * 1'
+
+jobs:
+  compare-live-artifacts:
+    name: Compare live artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Run 15-repo production/reference comparison
+        run: |
+          python3 scripts/live_security_context_audit.py \
+            --all \
+            --skip-local \
+            --verify-full-clone \
+            --clone-dir "${RUNNER_TEMP}/security-context-full-clones" \
+            --clone-timeout 1800 \
+            --timeout 120 \
+            --out-dir "runs/security_context_audit/${GITHUB_RUN_ID}"
+
+      - name: Upload comparison artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: security-context-audit-${{ github.run_id }}
+          path: runs/security_context_audit/${{ github.run_id }}

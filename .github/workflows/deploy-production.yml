@@ -1,0 +1,37 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ai-supply-chain-trust-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy production stack
+    runs-on: [self-hosted, ai-repo-trust]
+    timeout-minutes: 30
+    env:
+      DEPLOY_DIR: /opt/ai-repo-trust
+      ENV_FILE: /opt/ai-repo-trust/.env.prod
+      GITHUB_TOKEN: ${{ secrets.AI_REPO_TRUST_GITHUB_TOKEN }}
+      GITHUB_TOKENS: ${{ secrets.AI_REPO_TRUST_GITHUB_TOKENS }}
+      AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN: ${{ secrets.AI_REPO_TRUST_WORKER_TOKEN }}
+      AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL: ${{ secrets.AI_REPO_TRUST_ALERT_WEBHOOK_URL }}
+      AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL: ${{ secrets.AI_REPO_TRUST_FEEDBACK_WEBHOOK_URL }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Deploy and verify
+        run: .github/deploy/production/deploy-prod.sh "$DEPLOY_DIR" "$ENV_FILE"

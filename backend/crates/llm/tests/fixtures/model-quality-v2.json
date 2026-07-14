@@ -1,0 +1,122 @@
+[
+  {
+    "id": "auth-bypass",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "medium" },
+      "evidence": [{ "id": "commit_1", "sha": "9704c8e9fcc5", "subject": "fix middleware authentication bypass", "date": "2025-01-01T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Auth Bypass",
+    "expected_severity": "high"
+  },
+  {
+    "id": "bounds-dos",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "low" },
+      "evidence": [{ "id": "commit_1", "sha": "6ab2d307bd10", "subject": "reject oversized parser input to prevent denial of service", "date": "2025-02-02T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Denial of Service",
+    "expected_severity": "medium"
+  },
+  {
+    "id": "path-traversal",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Path Traversal", "severity": "high" },
+      "evidence": [{ "id": "commit_1", "sha": "a7c3f981d210", "subject": "normalize archive paths before extraction to block path traversal", "date": "2025-03-03T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Path Traversal",
+    "expected_severity": "high"
+  },
+  {
+    "id": "xss",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Cross-Site Scripting", "severity": "medium" },
+      "evidence": [{ "id": "commit_1", "sha": "bc01a5e9f222", "subject": "escape untrusted HTML in rendered comments", "date": "2025-04-04T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Cross-Site Scripting",
+    "expected_severity": "medium"
+  },
+  {
+    "id": "ssrf-cloud-metadata",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "medium" },
+      "evidence": [{ "id": "commit_1", "sha": "d101a5e9f333", "subject": "block server-side request forgery access to cloud metadata credentials", "date": "2025-05-05T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Server-Side Request Forgery",
+    "expected_severity": "high"
+  },
+  {
+    "id": "sql-injection",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Injection", "severity": "high" },
+      "evidence": [{ "id": "commit_1", "sha": "e202b6f0a444", "subject": "parameterize login query to prevent SQL injection", "date": "2025-06-06T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Injection",
+    "expected_severity": "high"
+  },
+  {
+    "id": "use-after-free",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "critical" },
+      "evidence": [{ "id": "commit_1", "sha": "f303c7a1b555", "subject": "prevent remotely reachable use after free in message decoder", "date": "2025-07-07T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Use After Free",
+    "expected_severity": "critical"
+  },
+  {
+    "id": "information-disclosure",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "low" },
+      "evidence": [{ "id": "commit_1", "sha": "a404d8b2c666", "subject": "redact session tokens from medium severity error responses", "date": "2025-08-08T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Information Disclosure",
+    "expected_severity": "medium"
+  },
+  {
+    "id": "race-condition",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Race Condition", "severity": "medium" },
+      "evidence": [{ "id": "commit_1", "sha": "b505e9c3d777", "subject": "serialize permission update to close authorization race condition", "date": "2025-09-09T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Race Condition",
+    "expected_severity": "medium"
+  },
+  {
+    "id": "integer-overflow",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Buffer Overflow", "severity": "high" },
+      "evidence": [{ "id": "commit_1", "sha": "c606f0d4e888", "subject": "check allocation multiplication for integer overflow", "date": "2025-10-10T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Integer Overflow",
+    "expected_severity": "high"
+  },
+  {
+    "id": "insecure-deserialization",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Remote Code Execution", "severity": "critical" },
+      "evidence": [{ "id": "commit_1", "sha": "d707a1e5f999", "subject": "disable unsafe object deserialization that permits remote code execution", "date": "2025-11-11T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Insecure Deserialization",
+    "expected_severity": "critical"
+  },
+  {
+    "id": "timing-side-channel",
+    "input": {
+      "task": "vulnerability_classification",
+      "rule_based_result": { "vuln_class": "Security Fix", "severity": "low" },
+      "evidence": [{ "id": "commit_1", "sha": "e808b2f6a111", "subject": "use constant-time comparison to reduce low severity timing side-channel", "date": "2025-12-12T00:00:00Z" }]
+    },
+    "expected_vuln_class": "Timing/Side-Channel",
+    "expected_severity": "low"
+  }
+]

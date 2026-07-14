@@ -1,0 +1,7 @@
+# AI Supply Chain Trust
+
+Open-source repository trust and safety evaluator by AIBIM. It converts public repository evidence into agent-ready context, vulnerability leads, JSON and Markdown artifacts, and MCP output.
+
+Core routes: /, /contexts, /r/<owner>/<repo>
+API: /api/v1/openapi.json
+Source: https://github.com/aibim-ai/AI-Supply-Chain-Trust

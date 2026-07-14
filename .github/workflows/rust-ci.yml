@@ -1,0 +1,128 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'scripts/security_independence_guard.sh'
+      - 'scripts/test_evidence.sh'
+      - 'scripts/benchmark_scan_pipeline.sh'
+      - '.github/workflows/rust-ci.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'scripts/security_independence_guard.sh'
+      - 'scripts/test_evidence.sh'
+      - 'scripts/benchmark_scan_pipeline.sh'
+      - '.github/workflows/rust-ci.yml'
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  BACKEND_DIR: backend
+
+jobs:
+  backend:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Check security data independence
+        run: scripts/security_independence_guard.sh
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          workspaces: backend -> target
+
+      - name: Check formatting
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test workspace
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo test --workspace --all-targets
+
+      - name: Check LLM guardrail boundaries
+        run: python3 backend/tests/test_llm_hallucination_guard.py
+
+  coverage:
+    name: Coverage evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853
+        with:
+          tool: cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          workspaces: backend -> target
+
+      - name: Generate and enforce coverage evidence
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: >-
+          cargo llvm-cov --workspace --all-targets
+          --lcov --output-path coverage.lcov
+          --fail-under-lines 60
+          --fail-under-functions 55
+
+      - name: Upload coverage evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-coverage-lcov
+          path: backend/coverage.lcov
+          if-no-files-found: error
+
+  main-verification:
+    name: Main branch verification
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [backend, coverage]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          workspaces: backend -> target
+
+      - name: Build verification harness
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo build --release -p verification-harness
+
+      - name: Run verification harness
+        timeout-minutes: 5
+        working-directory: ${{ env.BACKEND_DIR }}
+        # Determinism needs a stable external fixture, not two full history
+        # traversals of a very large repository. Production discovery and
+        # performance gates exercise the broader corpus separately.
+        run: cargo run --release -p verification-harness -- octocat/Hello-World
+        env:
+          GITHUB_TOKEN: ${{ secrets.AI_REPO_TRUST_GITHUB_TOKEN || github.token }}
+
+      - name: Build release binary
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo build --release -p ai-supply-chain-trust
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ai-supply-chain-trust-linux-amd64
+          path: backend/target/release/ai-supply-chain-trust

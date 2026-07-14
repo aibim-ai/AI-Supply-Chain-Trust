@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible product defect. Do not report vulnerabilities here.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: For security vulnerabilities, use GitHub private vulnerability reporting as described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide bounded steps, expected behavior, and actual behavior. Remove credentials and private repository data.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, browser or CLI version, deployment mode, and relevant non-secret configuration.
+    validations:
+      required: true

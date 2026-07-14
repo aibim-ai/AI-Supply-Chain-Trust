@@ -1,0 +1,52 @@
+displayNamePrefix: AI Supply Chain Trust
+combiner: OR
+policies:
+  - displayName: Queue backlog warning
+    metric: custom.googleapis.com/ai_supply_chain_trust/queue_depth
+    comparison: COMPARISON_GT
+    thresholdValue: 100
+    duration: 900s
+    severity: warning
+    documentation: Queue depth has stayed above 100 for 15 minutes.
+  - displayName: Queue backlog critical
+    metric: custom.googleapis.com/ai_supply_chain_trust/queue_depth
+    comparison: COMPARISON_GT
+    thresholdValue: 500
+    duration: 300s
+    severity: critical
+    documentation: Queue depth has exceeded 500; stop increasing Cloud Run instances until leasing and scanner throughput are healthy.
+  - displayName: Scanner failures warning
+    metric: custom.googleapis.com/ai_supply_chain_trust/scanner_failure_total
+    comparison: COMPARISON_GT
+    thresholdValue: 5
+    duration: 900s
+    severity: warning
+    documentation: Scanner failures are elevated. Inspect worker logs grouped by correlation_id and scanner.
+  - displayName: Scanner failures critical
+    metric: custom.googleapis.com/ai_supply_chain_trust/scanner_failure_total
+    comparison: COMPARISON_GT
+    thresholdValue: 20
+    duration: 600s
+    severity: critical
+    documentation: Scanner failures are high enough to degrade trust reports; consider opening circuit breakers or rolling back async mode.
+  - displayName: Webhook signature failures
+    metric: custom.googleapis.com/ai_supply_chain_trust/webhook_signature_failures_total
+    comparison: COMPARISON_GT
+    thresholdValue: 5
+    duration: 600s
+    severity: warning
+    documentation: GitHub webhook signature failures exceeded the warning threshold.
+  - displayName: Dead-letter scans
+    metric: custom.googleapis.com/ai_supply_chain_trust/dead_letter_scans_total
+    comparison: COMPARISON_GT
+    thresholdValue: 3
+    duration: 900s
+    severity: warning
+    documentation: Scanner jobs are entering dead-letter state; inspect scanner stderr payloads and task retry_count.
+  - displayName: DB replication lag
+    metric: custom.googleapis.com/ai_supply_chain_trust/db_replication_lag_seconds
+    comparison: COMPARISON_GT
+    thresholdValue: 30
+    duration: 600s
+    severity: warning
+    documentation: Dual-write or replica lag is above 30 seconds during cutover rehearsal.

@@ -1,0 +1,253 @@
+name: ai-supply-chain-trust-prod
+
+services:
+  backend:
+    build:
+      context: ../../../backend
+      dockerfile: Dockerfile
+    image: ai-supply-chain-trust-rust:prod
+    container_name: ai-supply-chain-trust-backend-prod
+    env_file:
+      - path: ${AI_SUPPLY_CHAIN_TRUST_ENV_FILE:-../../../.env.prod}
+        required: false
+    environment:
+      PORT: 8080
+      AI_SUPPLY_CHAIN_TRUST_HOST: 0.0.0.0
+      AI_SUPPLY_CHAIN_TRUST_DB: /data/trust.db
+      DATABASE_URL: ${DATABASE_URL:-}
+      AI_SUPPLY_CHAIN_TRUST_DB_PATH: /data/trust.db
+      AI_SUPPLY_CHAIN_TRUST_BASE_URL: ${AI_SUPPLY_CHAIN_TRUST_BASE_URL:-https://ai-supply-chain-trust.aibim.ai}
+      AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT: ${AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT:-json}
+      AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS:-120}
+      AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS:-5}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON: "0"
+      AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN: ${AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN:-}
+      AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL: ${AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL:-}
+      AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL: ${AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL:-}
+      RUST_LOG: ${RUST_LOG:-ai_supply_chain_trust_server=info,tower_http=info}
+    expose:
+      - "8080"
+    volumes:
+      - /opt/ai-repo-trust/data:/data
+    networks:
+      trust-backend:
+      aibim-app-network:
+        aliases:
+          - ai-supply-chain-trust-backend
+          # The shared edge proxy is deployed independently and still resolves
+          # this stable legacy alias. Keep it until that proxy is migrated.
+          - ai-repo-trust-backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 1G
+        reservations:
+          cpus: "0.15"
+          memory: 192M
+
+  worker:
+    image: ai-supply-chain-trust-rust:prod
+    container_name: ai-supply-chain-trust-worker-prod
+    env_file:
+      - path: ${AI_SUPPLY_CHAIN_TRUST_ENV_FILE:-../../../.env.prod}
+        required: false
+    environment:
+      PORT: 8080
+      AI_SUPPLY_CHAIN_TRUST_HOST: 0.0.0.0
+      AI_SUPPLY_CHAIN_TRUST_DB: /data/trust.db
+      DATABASE_URL: ${DATABASE_URL:-}
+      AI_SUPPLY_CHAIN_TRUST_DB_PATH: /data/trust.db
+      AI_SUPPLY_CHAIN_TRUST_BASE_URL: ${AI_SUPPLY_CHAIN_TRUST_BASE_URL:-https://ai-supply-chain-trust.aibim.ai}
+      AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT: ${AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT:-json}
+      AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS:-120}
+      AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS:-5}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON: ${AI_SUPPLY_CHAIN_TRUST_DAEMON:-1}
+      AI_SUPPLY_CHAIN_TRUST_WORKER_ROLE: general
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_QUEUE_INTERVAL: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_QUEUE_INTERVAL:-1}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_INTERVAL: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_INTERVAL:-86400}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_LIMIT: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_LIMIT:-10}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_DAYS: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_DAYS:-7}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_MIN_STARS: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_MIN_STARS:-500}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_MULTI_SOURCE: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_MULTI_SOURCE:-1}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON_MAX_CONCURRENT: ${AI_SUPPLY_CHAIN_TRUST_DAEMON_MAX_CONCURRENT:-4}
+      AI_SUPPLY_CHAIN_TRUST_WORKER_START_DELAY_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_WORKER_START_DELAY_SECONDS:-0}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_INTERVAL_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_INTERVAL_SECONDS:-1}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_HISTORY_BATCH: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_HISTORY_BATCH:-1}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_HISTORY_CONCURRENCY: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_HISTORY_CONCURRENCY:-2}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_DETAIL_BATCH: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_DETAIL_BATCH:-2}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_CONCURRENCY: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_CONCURRENCY:-1}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_ENABLED: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_ENABLED:-0}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_MODE: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_MODE:-off}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_FINALIZE_CONCURRENCY: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_FINALIZE_CONCURRENCY:-1}
+      AI_SUPPLY_CHAIN_TRUST_NVD_TASK_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_NVD_TASK_TIMEOUT_SECONDS:-90}
+      AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL: ${AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL:-}
+      AI_SUPPLY_CHAIN_TRUST_ALERT_INTERVAL_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_ALERT_INTERVAL_SECONDS:-60}
+      AI_SUPPLY_CHAIN_TRUST_FAILURE_RECOVERY_INTERVAL_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_FAILURE_RECOVERY_INTERVAL_SECONDS:-600}
+      AI_SUPPLY_CHAIN_TRUST_PROGRESSIVE_COMMIT_DETAIL_LIMIT: ${AI_SUPPLY_CHAIN_TRUST_PROGRESSIVE_COMMIT_DETAIL_LIMIT:-25}
+      AI_SUPPLY_CHAIN_TRUST_PROGRESSIVE_HISTORY_MAX_PAGES: ${AI_SUPPLY_CHAIN_TRUST_PROGRESSIVE_HISTORY_MAX_PAGES:-10}
+      AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN: ${AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-ai_supply_chain_trust_server=info,tower_http=info}
+    expose:
+      - "8080"
+    volumes:
+      - /opt/ai-repo-trust/data:/data
+    networks:
+      - trust-backend
+    restart: unless-stopped
+    healthcheck:
+      # The worker does not serve production HTTP traffic. Evidence parsing can
+      # briefly occupy its async runtime, so an HTTP probe creates false
+      # negatives and causes external auto-heal services to restart healthy work.
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.25"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  nvd-worker:
+    image: ai-supply-chain-trust-rust:prod
+    container_name: ai-supply-chain-trust-nvd-worker-prod
+    env_file:
+      - path: ${AI_SUPPLY_CHAIN_TRUST_ENV_FILE:-../../../.env.prod}
+        required: false
+    environment:
+      PORT: 8080
+      AI_SUPPLY_CHAIN_TRUST_HOST: 0.0.0.0
+      AI_SUPPLY_CHAIN_TRUST_DB: /data/trust.db
+      DATABASE_URL: ${DATABASE_URL:-}
+      AI_SUPPLY_CHAIN_TRUST_DB_PATH: /data/trust.db
+      AI_SUPPLY_CHAIN_TRUST_BASE_URL: ${AI_SUPPLY_CHAIN_TRUST_BASE_URL:-https://ai-supply-chain-trust.aibim.ai}
+      AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT: ${AI_SUPPLY_CHAIN_TRUST_LOG_FORMAT:-json}
+      AI_SUPPLY_CHAIN_TRUST_DAEMON: "1"
+      AI_SUPPLY_CHAIN_TRUST_WORKER_ROLE: nvd
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_MODE: enabled
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_CONCURRENCY: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_NVD_CONCURRENCY:-1}
+      AI_SUPPLY_CHAIN_TRUST_NVD_TASK_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_NVD_TASK_TIMEOUT_SECONDS:-90}
+      AI_SUPPLY_CHAIN_TRUST_EVIDENCE_INTERVAL_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_EVIDENCE_INTERVAL_SECONDS:-1}
+      AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN: ${AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-ai_supply_chain_trust_server=info,tower_http=info}
+    expose:
+      - "8080"
+    volumes:
+      - /opt/ai-repo-trust/data:/data
+    networks:
+      - trust-backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 3G
+        reservations:
+          cpus: "0.10"
+          memory: 192M
+
+  frontend:
+    build:
+      context: ../../../frontend
+      dockerfile: Dockerfile
+    image: ai-supply-chain-trust-frontend:prod
+    container_name: ai-supply-chain-trust-frontend-prod
+    expose:
+      - "80"
+    networks:
+      trust-frontend:
+      aibim-app-network:
+        aliases:
+          - ai-supply-chain-trust-frontend
+          # See the backend alias above; removing this breaks the public edge.
+          - ai-repo-trust-frontend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/frontend-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.05"
+          memory: 16M
+
+  nginx:
+    image: nginx:alpine
+    container_name: ai-supply-chain-trust-nginx-prod
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    environment:
+      TRUST_DOMAIN: ${TRUST_DOMAIN:-ai-supply-chain-trust.aibim.ai}
+      FRONTEND_UPSTREAM: frontend:80
+      BACKEND_UPSTREAM: backend:8080
+    ports:
+      - "${TRUST_HTTP_PORT:-8050}:80"
+      - "${TRUST_HTTPS_PORT:-8051}:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - certbot_webroot:/var/www/certbot
+    networks:
+      - trust-backend
+      - trust-frontend
+      - trust-edge
+      - aibim-app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: ai-supply-chain-trust-certbot-prod
+    profiles: ["proxy"]
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'"
+    restart: unless-stopped
+
+volumes:
+  trust_data:
+  certbot_webroot:
+
+networks:
+  trust-edge:
+    name: ai-supply-chain-trust-edge
+  trust-backend:
+    name: ai-supply-chain-trust-backend
+  trust-frontend:
+    name: ai-supply-chain-trust-frontend
+  aibim-app-network:
+    external: true
+    name: aibim-app_default

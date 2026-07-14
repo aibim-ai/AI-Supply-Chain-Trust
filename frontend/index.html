@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#f8fafc" />
+    <meta
+      name="description"
+      content="Agent-ready security context for public software repositories."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        var theme = localStorage.theme;
+        var dark =
+          theme === "dark" ||
+          (!theme && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.classList.toggle("dark", dark);
+        document.documentElement.setAttribute(
+          "data-theme",
+          dark ? "dark" : "light",
+        );
+      })();
+    </script>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <title>AI Supply Chain Trust</title>
+    <!--SSR_HEAD-->
+  </head>
+  <body>
+    <!-- app-header -->
+    <div id="root"><!--SSR_MAIN--></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

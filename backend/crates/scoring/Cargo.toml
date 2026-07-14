@@ -1,0 +1,14 @@
+[package]
+name = "ai-supply-chain-trust-scoring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-supply-chain-trust-models = { path = "../models" }
+chrono.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest = "1"

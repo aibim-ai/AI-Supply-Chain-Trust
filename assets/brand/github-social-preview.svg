@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">AI Supply Chain Trust</title>
+  <desc id="desc">Repository trust and software supply-chain security scanner.</desc>
+  <defs>
+    <linearGradient id="leftShade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#071018" stop-opacity="0.96"/>
+      <stop offset="0.7" stop-color="#071018" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#071018" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <image x="0" y="0" width="1280" height="640" preserveAspectRatio="xMidYMid slice" xlink:href="github-social-background.jpg"/>
+  <rect width="1280" height="640" fill="url(#leftShade)"/>
+  <rect width="1280" height="8" fill="#20C97A"/>
+
+  <g transform="translate(72 60)">
+    <rect width="96" height="96" rx="22" fill="#F7FAFC"/>
+    <image x="8" y="8" width="80" height="80" xlink:href="ai-supply-chain-trust-mark.svg"/>
+  </g>
+
+  <text x="188" y="100" fill="#F7FAFC" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800" letter-spacing="0.8">AI SUPPLY CHAIN</text>
+  <text x="188" y="137" fill="#20C97A" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800" letter-spacing="5.4">TRUST</text>
+
+  <text x="72" y="272" fill="#F7FAFC" font-family="Inter, Arial, sans-serif" font-size="52" font-weight="800">
+    <tspan x="72" dy="0">Repository trust.</tspan>
+    <tspan x="72" dy="60">Backed by live evidence.</tspan>
+  </text>
+
+  <text x="72" y="407" fill="#B9C7D2" font-family="Inter, Arial, sans-serif" font-size="21" font-weight="400">
+    Supply-chain security scanning across eight evidence pillars.
+  </text>
+
+  <g transform="translate(72 500)" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="1.1">
+    <rect width="142" height="42" rx="21" fill="#13232D" stroke="#29414F"/>
+    <circle cx="22" cy="21" r="5" fill="#20C97A"/>
+    <text x="37" y="26" fill="#D9E5EC">LIVE EVIDENCE</text>
+
+    <rect x="156" width="166" height="42" rx="21" fill="#13232D" stroke="#29414F"/>
+    <circle cx="178" cy="21" r="5" fill="#20C97A"/>
+    <text x="193" y="26" fill="#D9E5EC">8-PILLAR SCORE</text>
+
+    <rect x="336" width="137" height="42" rx="21" fill="#13232D" stroke="#29414F"/>
+    <circle cx="358" cy="21" r="5" fill="#20C97A"/>
+    <text x="373" y="26" fill="#D9E5EC">RUST BUILT</text>
+  </g>
+</svg>

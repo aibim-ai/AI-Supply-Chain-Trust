@@ -1,0 +1,25 @@
+[
+  {
+    "name": "same symbol requires verification",
+    "changed_files": [{"path":"src/parser.rs","touched_symbols":["parse_packet"]}],
+    "expected_state": "potential_regression",
+    "expected_disposition": "verify"
+  },
+  {
+    "name": "same directory needs review",
+    "changed_files": [{"path":"src/parser/helpers.rs","touched_symbols":["helper"]}],
+    "expected_state": "needs_review",
+    "expected_disposition": "review"
+  },
+  {
+    "name": "unrelated documentation is observation only",
+    "changed_files": [{"path":"docs/parser.md","touched_symbols":[]}],
+    "expected_state": "not_touched",
+    "expected_disposition": "observe"
+  },
+  {
+    "name": "missing diff is unavailable",
+    "expected_state": "analysis_unavailable",
+    "expected_disposition": "unknown"
+  }
+]

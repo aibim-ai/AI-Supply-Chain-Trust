@@ -1,0 +1,30 @@
+[package]
+name = "ai-supply-chain-trust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-supply-chain-trust-server-new = { path = "../../crates/server" }
+ai-supply-chain-trust-render = { path = "../../crates/render" }
+ai-supply-chain-trust-storage = { path = "../../crates/storage" }
+ai-supply-chain-trust-service = { path = "../../crates/service" }
+ai-supply-chain-trust-cli = { path = "../../crates/cli" }
+ai-supply-chain-trust-scanner-runner = { path = "../../crates/scanner_runner" }
+ai-supply-chain-trust-discovery = { path = "../../crates/discovery" }
+ai-supply-chain-trust-models = { path = "../../crates/models" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+ai-supply-chain-trust-intelligence = { path = "../../crates/intelligence" }
+ai-supply-chain-trust-security-context = { path = "../../crates/security_context" }
+ai-supply-chain-trust-scoring = { path = "../../crates/scoring" }
+ai-supply-chain-trust-evaluator = { path = "../../crates/evaluator" }
+ai-supply-chain-trust-auth = { path = "../../crates/auth" }
+chrono.workspace = true

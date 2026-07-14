@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { FeedbackWidget } from "../components/FeedbackWidget";
+import { PageAnalytics } from "../components/PageAnalytics";
 
 const navigation = [
   ["/", "Home"],
@@ -168,6 +169,7 @@ export function AppShell() {
   const location = useLocation();
   return (
     <div className="app-shell">
+      <PageAnalytics />
       <header className="app-header">
         <div className="app-header-inner">
           <Link to="/" className="product-mark">

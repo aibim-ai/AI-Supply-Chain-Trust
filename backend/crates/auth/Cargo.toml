@@ -1,0 +1,13 @@
+[package]
+name = "ai-supply-chain-trust-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac = "0.12"
+base64 = "0.22"
+anyhow.workspace = true

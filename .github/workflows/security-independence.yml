@@ -1,0 +1,38 @@
+name: Security Data Independence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contribution-policy:
+    name: Human-authored pull request policy
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Reject bot-authored pull requests
+        run: |
+          case "$GITHUB_ACTOR" in
+            *'[bot]')
+              echo "Bot-authored pull requests are not accepted by repository policy."
+              exit 1
+              ;;
+          esac
+
+  guard:
+    name: Static independence guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Run guard
+        run: scripts/security_independence_guard.sh

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="900" height="240" viewBox="0 0 900 240" role="img" aria-labelledby="title desc">
+  <title id="title">AI Supply Chain Trust</title>
+  <desc id="desc">Dark-background logo with a continuous provenance path and verified terminal.</desc>
+  <image x="20" y="20" width="200" height="200" xlink:href="ai-supply-chain-trust-mark-dark.svg"/>
+  <text x="255" y="108" fill="#F7FAFC" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="800" letter-spacing="1.1">AI SUPPLY CHAIN</text>
+  <text x="255" y="181" fill="#16B978" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="800" letter-spacing="11">TRUST</text>
+</svg>

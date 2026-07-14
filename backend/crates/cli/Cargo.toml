@@ -1,0 +1,10 @@
+[package]
+name = "ai-supply-chain-trust-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

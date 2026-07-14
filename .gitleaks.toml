@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Security evidence source name in README prose"
+stopwords = ['''advisory/OSV''']

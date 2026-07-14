@@ -1,0 +1,11 @@
+[package]
+name = "ai-supply-chain-trust-scanner-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

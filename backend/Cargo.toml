@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/models",
+    "crates/scoring",
+    "crates/evaluator",
+    "crates/intelligence",
+    "crates/llm",
+    "crates/security_context",
+    "crates/storage",
+    "crates/github_metadata",
+    "crates/service",
+    "crates/server",
+    "crates/render",
+    "crates/auth",
+    "crates/scanner_runner",
+    "crates/discovery",
+    "crates/cli",
+    "bin/ai-supply-chain-trust",
+    "bin/verification-harness",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["AIBIM"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
+base64 = "0.22"
+toml = "0.8"
+mime_guess = "2"
+tower-http = { version = "0.6", features = ["cors"] }
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+jsonwebtoken = "9"
+clap = { version = "4", features = ["derive", "env"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+dotenvy = "0.15"

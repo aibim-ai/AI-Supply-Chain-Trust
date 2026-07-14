@@ -1371,6 +1371,32 @@ fn is_auxiliary_security_fix_path(path: &str) -> bool {
         || is_build_config_path(&lower)
         || is_macro_registry_path(&lower)
         || is_doc_path(&lower)
+        || is_content_data_path(&lower)
+}
+
+fn is_content_data_path(lower: &str) -> bool {
+    let flat_data_file = lower.ends_with(".csv")
+        || lower.ends_with(".tsv")
+        || lower.ends_with(".jsonl")
+        || lower.ends_with(".ndjson");
+    let content_directory = lower.starts_with("data/")
+        || lower.contains("/data/")
+        || lower.starts_with("dataset/")
+        || lower.starts_with("datasets/")
+        || lower.contains("/dataset/")
+        || lower.contains("/datasets/")
+        || lower.starts_with("content/")
+        || lower.contains("/content/")
+        || lower.starts_with("prompts/")
+        || lower.contains("/prompts/");
+    let content_extension = lower.ends_with(".json")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".parquet")
+        || lower.ends_with(".arrow");
+
+    flat_data_file || content_directory && content_extension
 }
 
 fn is_test_path(lower: &str) -> bool {
@@ -1576,77 +1602,117 @@ async fn llm_ecosystem_resolution(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn looks_security_relevant(message: &str) -> bool {
+    // Commit bodies routinely contain generated changelogs, scanner output,
+    // linked issues, and CVE lists unrelated to the change.  Candidate
+    // selection therefore uses the subject only.  Detail evidence is fetched
+    // later for candidates that do not carry an advisory identifier.
     let lower = message.to_ascii_lowercase();
-    let direct_security_terms = [
-        "security",
-        "vuln",
-        "cve",
-        "cwe",
-        "xss",
-        "csrf",
-        "ssrf",
-        "bypass",
-        "injection",
-        "disclosure",
-        "auth bypass",
-        "authentication",
-        "authorization",
-        "unauthorized",
-        "buffer overflow",
-        "use after free",
-        "double free",
-        "null pointer",
-        "out of bounds",
-        "race condition",
-        "timing attack",
-        "side channel",
-        "memory corruption",
-        "arbitrary code",
-        "rce",
-        "privilege escalation",
-        "integer overflow",
-        "heap overflow",
-        "stack overflow",
-        "format string",
-        "dangling pointer",
-        "uninitialized",
-        "type confusion",
+    let subject = lower.lines().next().unwrap_or("").trim();
+    let remediation_terms = [
+        "fix",
+        "fixed",
+        "fixes",
+        "fixing",
+        "patch",
+        "patched",
+        "mitigate",
+        "mitigates",
+        "harden",
+        "hardening",
+        "prevent",
+        "prevents",
+        "avoid",
+        "remediate",
+        "address",
+        "resolve",
+        "resolves",
+        "block",
+        "protect",
+        "bump",
+        "upgrade",
     ];
-    if direct_security_terms
+    let has_remediation = remediation_terms
         .iter()
-        .any(|term| lower.contains(term))
-    {
-        return true;
+        .any(|term| contains_ascii_token(subject, term));
+    if !has_remediation {
+        return false;
     }
 
-    let fix_terms = ["fix", "patch", "mitigate", "harden", "prevent", "avoid"];
-    let risk_terms = [
-        "sanitize",
-        "escape",
-        "validate",
-        "overflow",
-        "underflow",
-        "leak",
-        "encrypt",
-        "decrypt",
-        "permission",
-        "privilege",
-        "token",
-        "secret",
-        "credential",
-        "pointer",
-        "bounds",
-        "memory",
-        "race",
-        "crash",
-        "hang",
-        "denial",
-        "infinite loop",
-        "allocation failure",
-    ];
+    contains_advisory_identifier(subject)
+        || contains_ascii_token(subject, "vulnerability")
+        || contains_ascii_token(subject, "vulnerabilities")
+        || contains_ascii_token(subject, "vulnerable")
+        || contains_ascii_token(subject, "security")
+        || has_high_confidence_vulnerability_phrase(subject)
+        || contains_any(
+            subject,
+            &[
+                "security fix",
+                "security issue",
+                "security hardening",
+                "certificate validation",
+                "certificate verification",
+                "signature verification",
+                "unauthorized access",
+                "access control",
+                "credential leak",
+                "credential exposure",
+                "secret leak",
+                "secret exposure",
+                "permission check",
+                "input sanitization",
+                "sanitize input",
+                "escape input",
+                "validate input",
+            ],
+        )
+}
 
-    fix_terms.iter().any(|term| lower.contains(term))
-        && risk_terms.iter().any(|term| lower.contains(term))
+fn contains_advisory_identifier(text: &str) -> bool {
+    ["cve", "ghsa", "cwe"]
+        .iter()
+        .any(|term| contains_ascii_token(text, term))
+}
+
+fn has_high_confidence_vulnerability_phrase(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "auth bypass",
+            "authentication bypass",
+            "authorization bypass",
+            "remote code execution",
+            "code execution",
+            "arbitrary code",
+            "command injection",
+            "sql injection",
+            "shell injection",
+            "code injection",
+            "template injection",
+            "ldap injection",
+            "prompt injection",
+            "buffer overflow",
+            "heap overflow",
+            "use after free",
+            "use-after-free",
+            "double free",
+            "memory corruption",
+            "denial of service",
+            "privilege escalation",
+            "information disclosure",
+            "cross-site scripting",
+            "cross site scripting",
+            "path traversal",
+            "directory traversal",
+            "timing attack",
+            "side channel",
+            "side-channel",
+            "type confusion",
+            "insecure deserialization",
+        ],
+    ) || ["rce", "xss", "csrf", "ssrf", "sqli"]
+        .iter()
+        .any(|term| contains_ascii_token(text, term))
 }
 
 #[cfg(test)]
@@ -1711,23 +1777,39 @@ fn classify_vuln_class_with_evidence(
         ))
     {
         "Improper Certificate Validation"
-    } else if lower.contains("bypass")
-        || lower.contains("authentication")
-        || lower.contains("authorization")
-        || lower.contains("unauthorized")
-    {
+    } else if contains_any(
+        &evidence,
+        &[
+            "auth bypass",
+            "authentication bypass",
+            "authorization bypass",
+            "unauthorized access",
+            "access control bypass",
+        ],
+    ) {
         "Auth Bypass"
-    } else if lower.contains("xss") || lower.contains("cross-site scripting") {
+    } else if contains_ascii_token(&lower, "xss") || lower.contains("cross-site scripting") {
         "Cross-Site Scripting"
-    } else if lower.contains("csrf") || lower.contains("cross-site request") {
+    } else if contains_ascii_token(&lower, "csrf") || lower.contains("cross-site request forgery") {
         "CSRF"
-    } else if lower.contains("ssrf") || lower.contains("server-side request") {
+    } else if contains_ascii_token(&lower, "ssrf") || lower.contains("server-side request forgery")
+    {
         "Server-Side Request Forgery"
-    } else if lower.contains("denial of service") || lower.contains("dos") {
+    } else if lower.contains("denial of service") || contains_ascii_token(&lower, "dos") {
         "Denial of Service"
-    } else if lower.contains("injection")
-        || lower.contains("sqli")
-        || lower.contains("command injection")
+    } else if contains_any(
+        &evidence,
+        &[
+            "command injection",
+            "sql injection",
+            "shell injection",
+            "code injection",
+            "template injection",
+            "ldap injection",
+            "prompt injection",
+            "injection vulnerability",
+        ],
+    ) || contains_ascii_token(&lower, "sqli")
     {
         "Injection"
     } else if lower.contains("use after free")
@@ -1766,7 +1848,8 @@ fn classify_vuln_class_with_evidence(
         "NULL Pointer Dereference"
     } else if lower.contains("race condition") || lower.contains("toctou") {
         "Race Condition"
-    } else if lower.contains("timing")
+    } else if lower.contains("timing attack")
+        || lower.contains("timing leak")
         || lower.contains("side channel")
         || lower.contains("side-channel")
         || lower.contains("constant time")
@@ -1774,12 +1857,21 @@ fn classify_vuln_class_with_evidence(
         || contains_any(&evidence, &["cache timing", "timing leak"])
     {
         "Timing/Side-Channel"
-    } else if lower.contains("memory leak")
-        || lower.contains("information disclosure")
-        || lower.contains("leak")
+    } else if lower.contains("information disclosure")
+        || contains_any(
+            &evidence,
+            &[
+                "data leak",
+                "secret leak",
+                "credential leak",
+                "token leak",
+                "privacy leak",
+                "sensitive information leak",
+            ],
+        )
     {
         "Information Disclosure"
-    } else if lower.contains("rce")
+    } else if contains_ascii_token(&lower, "rce")
         || lower.contains("arbitrary code")
         || lower.contains("code execution")
     {
@@ -1792,7 +1884,7 @@ fn classify_vuln_class_with_evidence(
         "Type Confusion"
     } else if lower.contains("deserial") {
         "Insecure Deserialization"
-    } else if lower.contains("traversal") || lower.contains("path traversal") {
+    } else if lower.contains("path traversal") || lower.contains("directory traversal") {
         "Path Traversal"
     } else {
         "Security Fix"
@@ -2164,6 +2256,73 @@ mod tests {
     }
 
     #[test]
+    fn security_candidate_matching_uses_semantic_boundaries() {
+        assert!(!looks_security_relevant(
+            "Add prompt: Unified Research and Source Analysis Prompt"
+        ));
+        assert!(!looks_security_relevant(
+            "fix(images): reconcile mismatched image media types before send"
+        ));
+        assert!(!looks_security_relevant(
+            "fix: remove unexpected force argument"
+        ));
+        assert!(!looks_security_relevant(
+            "Update prompt: Android AI App Security Specialist Task"
+        ));
+        assert!(!looks_security_relevant(
+            "feat: add authentication settings"
+        ));
+        assert!(!looks_security_relevant(
+            "Fixes race condition in model training"
+        ));
+        assert!(!looks_security_relevant(
+            "Fix NNX checkpoint axis out of bounds error"
+        ));
+        assert!(!looks_security_relevant(
+            "Fix worker stack overflow by heap-allocating futures"
+        ));
+        assert!(!looks_security_relevant(
+            "feat(rules): add cross-site scripting detector"
+        ));
+        assert!(!looks_security_relevant(
+            "Import upstream tests for CVE-2024-0727"
+        ));
+        assert!(!looks_security_relevant(
+            "feat: release model catalog\n\nfix CVE-2026-1234 in generated changelog"
+        ));
+        assert!(looks_security_relevant(
+            "security: harden certificate validation"
+        ));
+        assert!(looks_security_relevant(
+            "fix: prevent unauthorized access to private sessions"
+        ));
+        assert!(looks_security_relevant(
+            "fix: prevent buffer overflow in archive parser"
+        ));
+        assert!(looks_security_relevant(
+            "deps: bump protobuf for CVE-2026-41242"
+        ));
+    }
+
+    #[test]
+    fn replays_security_history_precision_corpus() {
+        let corpus: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/security_history_precision.json"
+        ))
+        .expect("precision corpus should be valid JSON");
+
+        for case in corpus {
+            let message = case["message"].as_str().expect("message");
+            let expected = case["expected"].as_bool().expect("expected");
+            assert_eq!(
+                looks_security_relevant(message),
+                expected,
+                "unexpected classification for {message:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_last_page_from_github_link_header() {
         let link = r#"<https://api.github.com/repositories/123/commits?sha=main&per_page=1&page=2>; rel="next", <https://api.github.com/repositories/123/commits?sha=main&per_page=1&page=21314>; rel="last""#;
         assert_eq!(last_page_from_link(link), Some(21314));
@@ -2406,6 +2565,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_content_dataset_only_weak_security_commits() {
+        let files = vec![file("prompts.csv"), file("content/prompts.jsonl")];
+
+        assert!(!should_keep_security_fix_commit(
+            "fix: correct security specialist prompt metadata",
+            &files
+        ));
+        assert!(should_keep_security_fix_commit(
+            "fix CVE-2026-1234 advisory metadata",
+            &files
+        ));
+        assert!(!is_auxiliary_security_fix_path("src/data/validator.py"));
+    }
+
+    #[test]
     fn keeps_explicit_vulnerability_evidence_on_build_config_paths() {
         let files = vec![file("configure.ac")];
 
@@ -2586,6 +2760,34 @@ mod tests {
         assert_eq!(
             classify_vuln_class("fix double free during certificate teardown"),
             "Double Free"
+        );
+    }
+
+    #[test]
+    fn vulnerability_classes_reject_generic_substrings_and_feature_terms() {
+        assert_eq!(
+            classify_vuln_class("Add Unified Research and Source Analysis Prompt"),
+            "Security Fix"
+        );
+        assert_eq!(
+            classify_vuln_class("fix authentication settings"),
+            "Security Fix"
+        );
+        assert_eq!(
+            classify_vuln_class("refactor dependency injection container"),
+            "Security Fix"
+        );
+        assert_eq!(
+            classify_vuln_class("fix memory leak in image cache"),
+            "Security Fix"
+        );
+        assert_eq!(
+            classify_vuln_class("fix RCE in archive parser"),
+            "Remote Code Execution"
+        );
+        assert_eq!(
+            classify_vuln_class("fix authentication bypass in login"),
+            "Auth Bypass"
         );
     }
 

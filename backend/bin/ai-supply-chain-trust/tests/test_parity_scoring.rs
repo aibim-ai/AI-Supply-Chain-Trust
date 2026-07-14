@@ -96,7 +96,7 @@ mod security_context_tests {
             },
             "observed_metrics": {
                 "metadata": {"default_branch":"main","head_sha":"abc","commit_count":10},
-                "security_context_version": "2026-07-08-live-github-v1",
+                "security_context_version": "2026-07-14-history-precision-v2",
                 "verification_status": "ok",
                 "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
                 "security_intel": {
@@ -170,7 +170,7 @@ mod evidence_tests {
     fn report_with_version_and_sha_passes() {
         let report = json!({
             "observed_metrics": {
-                "security_context_version": "2026-07-08-live-github-v1",
+                "security_context_version": "2026-07-14-history-precision-v2",
                 "verification_status": "ok",
                 "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
             },

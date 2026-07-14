@@ -152,7 +152,7 @@ mod cross_reference {
             "scanner_runs": [],
             "pillar_scores": {},
             "observed_metrics": {
-                "security_context_version": "2026-07-08-live-github-v1",
+                "security_context_version": "2026-07-14-history-precision-v2",
                 "verification_status": "mismatch",
                 "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
                 "metadata": {"head_sha": "x", "default_branch": "main"}

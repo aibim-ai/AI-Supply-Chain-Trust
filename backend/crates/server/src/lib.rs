@@ -514,10 +514,20 @@ fn maybe_start_queue_worker(service: Arc<Service>, discovery_token: Option<Strin
     let finalize_service = service.clone();
     let notification_service = service.clone();
     let recovery_service = service.clone();
+    let stale_context_service = service.clone();
     let recovery_interval_secs = env_u64(
         "AI_SUPPLY_CHAIN_TRUST_FAILURE_RECOVERY_INTERVAL_SECONDS",
         600,
     );
+    tokio::spawn(async move {
+        if worker_start_delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(worker_start_delay_secs)).await;
+        }
+        match stale_context_service.enqueue_stale_security_context_rescans(50_000) {
+            Ok(result) => info!(%result, "Stale security contexts queued for precision rescan"),
+            Err(error) => warn!(%error, "Failed to queue stale security-context rescans"),
+        }
+    });
     tokio::spawn(async move {
         if worker_start_delay_secs > 0 {
             tokio::time::sleep(Duration::from_secs(worker_start_delay_secs)).await;

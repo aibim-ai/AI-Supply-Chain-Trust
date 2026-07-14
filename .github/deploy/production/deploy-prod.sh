@@ -250,7 +250,7 @@ verify_backend_frontend() {
   echo "=== Frontend health check ==="
   run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-frontend-prod wget -q -O - http://127.0.0.1/frontend-health
   run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-frontend-prod wget -q -O - http://127.0.0.1/ | grep -q '/assets/css/design-system.css'
-  run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-frontend-prod wget -q -O /dev/null http://127.0.0.1/free-tools/assets/js/HomePage.js
+  run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-frontend-prod wget -q -O /dev/null http://127.0.0.1/assets/js/app.js
 }
 
 verify_deploy() {

@@ -2,7 +2,7 @@ use ai_supply_chain_trust_models::VerifiedEvidenceBuilder;
 use serde_json::{Map, Value};
 
 /// Security context version string. Must match Python `LIVE_SECURITY_CONTEXT_VERSION`.
-pub const LIVE_SECURITY_CONTEXT_VERSION: &str = "2026-07-08-live-github-v1";
+pub const LIVE_SECURITY_CONTEXT_VERSION: &str = "2026-07-14-history-precision-v2";
 
 /// Checks whether a report has sufficient live evidence to produce a
 /// security context. Returns true only if the evidence gate passes.

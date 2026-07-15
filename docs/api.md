@@ -242,7 +242,7 @@ GET /r/{owner}/{repo}.leads.json
 GET /r/{owner}/{repo}.leads.md
 → 200 text/markdown
 
-GET /free-tools/r/{owner}/{repo}
+GET /r/{owner}/{repo}
 → 200 text/html (SPA page)
 ```
 

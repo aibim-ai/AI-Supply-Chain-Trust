@@ -25,12 +25,24 @@ proxy configuration uses the new `ai-supply-chain-trust-*` aliases.
 
 ## Routing
 
-- `/free-tools/` and browser routes -> frontend
+- `/` and browser routes -> frontend
 - `/api`, `/api/*`, `/health`, `/sitemap.xml` -> backend
 - `/mcp` -> backend
-- `/r/*.json`, `/r/*.md`, `/free-tools/r/*.json`, `/free-tools/r/*.md` -> backend
-- `/r/{owner}/{repo}` and `/free-tools/r/{owner}/{repo}` -> SPA shell
+- `/r/*.json`, `/r/*.md` -> backend
+- `/r/{owner}/{repo}` -> SPA shell
+- legacy `/free-tools/*` URLs -> permanent redirect to the equivalent root URL
 - `/api/v1/events` -> backend with proxy buffering disabled
+
+## Sitemap policy
+
+`/sitemap.xml` lists the six public core pages first. Repository context pages
+follow in most-recently-evaluated order and are capped at 500 entries, well
+below the protocol ceiling of 50,000 URLs or 50 MB uncompressed per sitemap.
+Repository entries use the report evaluation date as `lastmod`; core pages omit
+`lastmod` because no independently verifiable publication date is stored.
+
+Only canonical root URLs are emitted. Legacy `/free-tools/*` paths remain as
+permanent redirects for inbound-link migration and never appear in the sitemap.
 
 Only Nginx publishes host ports. Backend and worker are reachable only on private
 Docker networks.

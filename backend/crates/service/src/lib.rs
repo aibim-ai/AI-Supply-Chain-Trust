@@ -245,7 +245,7 @@ impl Service {
             metrics.insert("security_intel".into(), intel_json);
             metrics.insert(
                 "security_context_version".into(),
-                json!("2026-07-08-live-github-v1"),
+                json!(ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION),
             );
             metrics.insert(
                 "verification_status".into(),
@@ -971,6 +971,48 @@ impl Service {
         self.db
             .enqueue_rescan_with_lane(repo, priority, "background")
             .map_err(|e| e.to_string())
+    }
+
+    /// Queue reports produced by an older security-context classifier for a
+    /// low-priority background rescan. Pending jobs are deduplicated by the
+    /// storage layer, so this is safe to run on every worker restart.
+    pub fn enqueue_stale_security_context_rescans(&self, limit: i64) -> Result<Value, String> {
+        let rows = self.db.recent_scans(limit.clamp(1, 50_000));
+        let mut stale_repos = Vec::new();
+        let mut job_ids = Vec::new();
+
+        for repo in rows
+            .iter()
+            .filter_map(|row| row.get("repo").and_then(Value::as_str))
+        {
+            let Some(report) = self.db.get_report(repo) else {
+                continue;
+            };
+            let version = report
+                .get("observed_metrics")
+                .and_then(|metrics| metrics.get("security_context_version"))
+                .and_then(Value::as_str);
+            if version
+                == Some(ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION)
+            {
+                continue;
+            }
+
+            let job_id = self
+                .db
+                .enqueue_rescan_with_lane(repo, -100, "background")
+                .map_err(|error| error.to_string())?;
+            stale_repos.push(repo.to_string());
+            job_ids.push(job_id);
+        }
+
+        Ok(json!({
+            "examined": rows.len(),
+            "stale": stale_repos.len(),
+            "repos": stale_repos,
+            "job_ids": job_ids,
+            "target_version": ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION
+        }))
     }
     pub async fn run_progressive_scan(&self, repo: &str) -> Result<(i64, Value), String> {
         let job_id = self
@@ -1951,7 +1993,7 @@ mod tests {
             "pillar_scores": {"publisher_credibility": {"name":"Publisher","normalized":80.0,"evidence":[],"concerns":[]}},
             "scanner_runs": [{"tool":"github-metadata-rust","status":"ok","detail":"ok"}],
             "observed_metrics": {
-                "security_context_version": "2026-07-08-live-github-v1",
+                "security_context_version": "2026-07-14-history-precision-v2",
                 "verification_status": "ok",
                 "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
                 "metadata": {"default_branch": "main", "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", "commit_count": 100}
@@ -2036,6 +2078,28 @@ mod tests {
         let context = svc.get_security_context("owner/repo", "https://example.com");
         assert_eq!(context["status"], json!("enriching"));
         assert_eq!(context["scan_state"], json!("fast_ready"));
+    }
+
+    #[test]
+    fn stale_security_contexts_are_requeued_in_the_background() {
+        let db = Arc::new(ai_supply_chain_trust_storage::Database::open_memory().unwrap());
+        let svc = Service::new(db.clone(), None);
+        let current = make_report("owner/current");
+        let mut stale = make_report("owner/stale");
+        stale["observed_metrics"]["security_context_version"] = json!("legacy-v1");
+        db.insert_report(&current).unwrap();
+        db.insert_report(&stale).unwrap();
+
+        let result = svc.enqueue_stale_security_context_rescans(100).unwrap();
+
+        assert_eq!(result["examined"], json!(2));
+        assert_eq!(result["stale"], json!(1));
+        assert_eq!(result["repos"], json!(["owner/stale"]));
+        let jobs = db.scan_jobs_recent(10);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["repo"], json!("owner/stale"));
+        assert_eq!(jobs[0]["lane"], json!("background"));
+        assert_eq!(jobs[0]["priority"], json!(-100));
     }
 
     #[test]

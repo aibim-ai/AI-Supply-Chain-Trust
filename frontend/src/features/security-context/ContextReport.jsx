@@ -1,9 +1,21 @@
-import { Braces, FileText, MessageSquare } from "lucide-react";
+import {
+  Bot,
+  Braces,
+  CircleAlert,
+  Copy,
+  ExternalLink,
+  FileText,
+  History,
+  MessageSquare,
+  Search,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 import { openFeedback } from "../../components/FeedbackWidget";
+import { captureProductEvent } from "../../lib/posthog";
 
 export function ContextReport({ repository, payload }) {
   const [filter, setFilter] = useState("default");
+  const [copied, setCopied] = useState("");
   const context = payload.context || {},
     summary = payload.summary || {};
   const trust = context.trust || payload.trust_decision || {};
@@ -36,6 +48,14 @@ export function ContextReport({ repository, payload }) {
       (fp) => severityRank(fp.severity) >= 3,
     ).length,
     generated = payload.generated_at || context.generated_at || "unknown";
+  const evidenceGaps = rowsFrom(
+    trust.missing_evidence || payload.missing_evidence,
+  );
+  const reviewLeads = Array.isArray(payload.leads?.leads)
+    ? payload.leads.leads
+    : Array.isArray(payload.leads?.findings)
+      ? payload.leads.findings
+      : [];
   const contractSummary = summarizeContracts(contracts);
   const visibleContracts = contracts.slice(0, 8);
   const remainingContracts = contracts.slice(8);
@@ -54,6 +74,20 @@ export function ContextReport({ repository, payload }) {
     () => sortFingerprints(fingerprints, filter),
     [fingerprints, filter],
   );
+  const publicUrl =
+    globalThis.window?.location?.href?.split("?")[0] ||
+    `https://ai-supply-chain-trust.aibim.ai/r/${repository}`;
+
+  async function copyAction(kind, value) {
+    try {
+      await globalThis.navigator?.clipboard?.writeText(value);
+      setCopied(kind);
+      captureProductEvent(kind, { repository });
+      globalThis.setTimeout(() => setCopied(""), 1600);
+    } catch {
+      setCopied("");
+    }
+  }
 
   return (
     <section className="securitycontext-page">
@@ -73,6 +107,41 @@ export function ContextReport({ repository, payload }) {
           <MessageSquare size={15} /> Feedback
         </button>
       </div>
+      <nav className="sc-utility-bar" aria-label="Reuse this context">
+        <button
+          type="button"
+          onClick={() => copyAction("public_link_copied", publicUrl)}
+        >
+          <Copy size={15} />
+          {copied === "public_link_copied" ? "Link copied" : "Copy public link"}
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            copyAction(
+              "mcp_query_copied",
+              `Use ${globalThis.window?.location?.origin || "https://ai-supply-chain-trust.aibim.ai"}/mcp to inspect ${repository}. Begin with evidence gaps, historical fixes or CVEs, and ranked review leads.`,
+            )
+          }
+        >
+          <Bot size={15} />
+          {copied === "mcp_query_copied"
+            ? "MCP query copied"
+            : "Copy MCP query"}
+        </button>
+        <a
+          className="sc-new-scan"
+          href="/"
+          onClick={() =>
+            captureProductEvent("next_repo_started", { repository })
+          }
+        >
+          Scan another repository
+        </a>
+        <div className="sc-utility-artifacts">
+          {artifactButtons(payload.artifacts, repository)}
+        </div>
+      </nav>
       <section className="sc-decision">
         <div className="sc-decision-copy">
           <span className="eyebrow">Decision support</span>
@@ -108,12 +177,87 @@ export function ContextReport({ repository, payload }) {
             <dd>{trust.confidence || payload.confidence || "unknown"}</dd>
           </div>
           <div>
-            <dt>Coverage</dt>
+            <dt>Evidence coverage</dt>
             <dd>
               {percent(trust.evidence_coverage ?? payload.evidence_coverage)}
             </dd>
           </div>
         </dl>
+      </section>
+      <section className="sc-activation" aria-labelledby="inspect-next-title">
+        <div className="sc-activation-heading">
+          <span className="eyebrow">Inspect next</span>
+          <h2 id="inspect-next-title">
+            Start with the evidence that can change the review.
+          </h2>
+        </div>
+        <div className="sc-activation-grid">
+          <a
+            href="#evidence-gaps"
+            onClick={() =>
+              captureProductEvent("evidence_gap_opened", {
+                repository,
+                source: "activation_card",
+              })
+            }
+          >
+            <CircleAlert size={19} />
+            <strong>{evidenceGaps.length} evidence gaps</strong>
+            <span>See which unavailable sources affect confidence.</span>
+          </a>
+          <a
+            href="#historical-evidence"
+            onClick={() =>
+              captureProductEvent("historical_evidence_opened", {
+                repository,
+                source: "activation_card",
+              })
+            }
+          >
+            <History size={19} />
+            <strong>{fixes + cveCount} historical signals</strong>
+            <span>
+              {fixes} fixes and {cveCount} disclosed CVEs to inspect.
+            </span>
+          </a>
+          <a
+            href="#review-leads"
+            onClick={() =>
+              captureProductEvent("review_lead_opened", {
+                repository,
+                source: "activation_card",
+              })
+            }
+          >
+            <Search size={19} />
+            <strong>{reviewLeads.length} ranked review leads</strong>
+            <span>
+              Open an evidence-backed starting point for deeper review.
+            </span>
+          </a>
+        </div>
+      </section>
+      <section className="sc-section sc-evidence-gaps" id="evidence-gaps">
+        <div className="sc-section-head">
+          <h2>
+            Evidence gaps <span>({evidenceGaps.length})</span>
+          </h2>
+          <span className="sc-ref">A gap is not a clean finding</span>
+        </div>
+        {evidenceGaps.length ? (
+          <div className="sc-gap-list">
+            {evidenceGaps.map((gap, index) => (
+              <article key={gap}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <p>{gap}</p>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">
+            No missing-evidence items were returned for this context.
+          </div>
+        )}
       </section>
       <section className="sc-hero">
         <aside className="sc-sidebar">
@@ -142,6 +286,9 @@ export function ContextReport({ repository, payload }) {
               <span>Regression coverage</span>
               <strong>{Math.round(coverage * 10) / 10}%</strong>
             </div>
+            <p>
+              Share of measurable historical fixes with observed guard evidence.
+            </p>
             {fixes > 0 ? (
               <>
                 <div className="sc-grid">
@@ -191,10 +338,53 @@ export function ContextReport({ repository, payload }) {
         </div>
         <footer className="sc-footer">
           <span>Last analyzed {formatDate(generated)}</span>
-          <div>{artifactButtons(payload.artifacts)}</div>
+          <div>{artifactButtons(payload.artifacts, repository)}</div>
         </footer>
       </section>
-      <section className="sc-section">
+      <section className="sc-section sc-review-leads" id="review-leads">
+        <div className="sc-section-head">
+          <h2>
+            Ranked review leads <span>({reviewLeads.length})</span>
+          </h2>
+          <span className="sc-ref">
+            Starting points, not confirmed findings
+          </span>
+        </div>
+        {reviewLeads.length ? (
+          <div className="sc-lead-list">
+            {reviewLeads.map((lead, index) => (
+              <article
+                key={`${lead.rank || index}:${lead.component || repository}`}
+              >
+                <span className="sc-lead-rank">#{lead.rank || index + 1}</span>
+                <div>
+                  <strong>{lead.component || repository}</strong>
+                  <p>{lead.why || lead.rationale || lead.evidence}</p>
+                  <div className="sc-refs">
+                    <span className="sc-ref">
+                      {lead.vulnerability_class ||
+                        lead.vuln_class ||
+                        "review focus"}
+                    </span>
+                    <span className="sc-ref">
+                      source:{" "}
+                      {String(lead.decision_source || "rule based").replaceAll(
+                        "_",
+                        " ",
+                      )}
+                    </span>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">
+            No ranked review lead was returned for this context.
+          </div>
+        )}
+      </section>
+      <section className="sc-section" id="historical-evidence">
         <div className="sc-section-head">
           <h2>Regression watchlist</h2>
           <div className="sc-refs" aria-label="Regression contract summary">
@@ -297,7 +487,9 @@ export function ContextReport({ repository, payload }) {
           <table className="sc-fixes">
             <tbody>
               {visibleFingerprints.length ? (
-                visibleFingerprints.slice(0, 12).map(fixRow)
+                visibleFingerprints
+                  .slice(0, 12)
+                  .map((fp, index) => fixRow(fp, index, repository))
               ) : (
                 <tr>
                   <td colSpan="5">
@@ -316,7 +508,11 @@ export function ContextReport({ repository, payload }) {
             </summary>
             <div className="sc-table-shell">
               <table className="sc-fixes">
-                <tbody>{visibleFingerprints.slice(12).map(fixRow)}</tbody>
+                <tbody>
+                  {visibleFingerprints
+                    .slice(12)
+                    .map((fp, index) => fixRow(fp, index + 12, repository))}
+                </tbody>
               </table>
             </div>
           </details>
@@ -328,7 +524,9 @@ export function ContextReport({ repository, payload }) {
         </h2>
         <div className="sc-cves">
           {cves.length ? (
-            cves.slice(0, 6).map(cveCard)
+            cves
+              .slice(0, 6)
+              .map((cve, index) => cveCard(cve, index, repository))
           ) : (
             <div className="empty-state">
               No disclosed CVEs were returned for this repository.
@@ -340,7 +538,11 @@ export function ContextReport({ repository, payload }) {
             <summary>
               Show all CVEs <span>({cves.length - 6} more)</span>
             </summary>
-            <div className="sc-cves">{cves.slice(6).map(cveCard)}</div>
+            <div className="sc-cves">
+              {cves
+                .slice(6)
+                .map((cve, index) => cveCard(cve, index + 6, repository))}
+            </div>
           </details>
         )}
       </section>
@@ -486,7 +688,10 @@ function shortEvidenceRef(value) {
   return `${kind}:${kind === "commit" ? shortSha(id) : id}`;
 }
 
-function fixRow(fp, index) {
+function fixRow(fp, index, repository) {
+  const commitUrl = fp.commit_sha
+    ? `https://github.com/${repository}/commit/${fp.commit_sha}`
+    : "";
   return (
     <tr
       data-class={fp.vuln_class || "Security Fix"}
@@ -505,17 +710,57 @@ function fixRow(fp, index) {
         {formatDate(fp.commit_date)}
       </td>
       <td data-label="Commit">
-        <code>{shortSha(fp.commit_sha)}</code>
+        {commitUrl ? (
+          <a
+            href={commitUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() =>
+              captureProductEvent("historical_fix_opened", {
+                repository,
+                commit_sha: fp.commit_sha,
+              })
+            }
+          >
+            <code>{shortSha(fp.commit_sha)}</code>
+            <ExternalLink size={12} />
+          </a>
+        ) : (
+          <code>-</code>
+        )}
       </td>
     </tr>
   );
 }
 
-function cveCard(cve, index) {
+function cveCard(cve, index, repository) {
+  const sourceUrl = cve.source_url || cve.url || cve.references?.[0]?.url || "";
+  const evidenceUrl =
+    sourceUrl ||
+    (/^CVE-\d{4}-\d+$/i.test(String(cve.id || ""))
+      ? `https://nvd.nist.gov/vuln/detail/${cve.id}`
+      : "");
   return (
     <article className="sc-cve-row" key={cve.id || index}>
       <div>
-        <strong>{cve.id || "CVE"}</strong>
+        {evidenceUrl ? (
+          <a
+            href={evidenceUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={() =>
+              captureProductEvent("cve_opened", {
+                repository,
+                cve_id: cve.id,
+              })
+            }
+          >
+            <strong>{cve.id || "CVE"}</strong>
+            <ExternalLink size={12} />
+          </a>
+        ) : (
+          <strong>{cve.id || "CVE"}</strong>
+        )}
         <SeverityPill value={cve.severity} />
         <span className="sc-ref">CVSS {cve.cvss ?? "-"}</span>
       </div>
@@ -542,7 +787,7 @@ function SeverityPill({ value }) {
   return <span className={`sc-pill pill-${tone}`}>{text}</span>;
 }
 
-function artifactButtons(artifacts = {}) {
+function artifactButtons(artifacts = {}, repository = "") {
   return Object.entries(artifacts).map(([name, href]) => (
     <a
       className="sc-icon-button"
@@ -550,6 +795,12 @@ function artifactButtons(artifacts = {}) {
       key={name}
       aria-label={name.replaceAll("_", " ")}
       title={name.replaceAll("_", " ")}
+      onClick={() =>
+        captureProductEvent("artifact_opened", {
+          repository,
+          artifact: name,
+        })
+      }
     >
       {name.toLowerCase().includes("json") ? <Braces /> : <FileText />}
       <span>{name.replaceAll("_", " ")}</span>

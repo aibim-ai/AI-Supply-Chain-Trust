@@ -6,6 +6,7 @@ import { ContextReport } from "../features/security-context/ContextReport";
 import { ScanProgress } from "../features/security-context/ScanProgress";
 import { useAsync } from "../hooks/use-async";
 import { trustApi } from "../lib/api-client";
+import { captureProductEvent } from "../lib/posthog";
 
 export default function ContextPage() {
   const [rescan, setRescan] = useState({ status: "idle", error: "" });
@@ -17,6 +18,14 @@ export default function ContextPage() {
   const query = useAsync(() => trustApi.context(repository), [repository]);
   const resultQuery = useAsync(() => trustApi.result(repository), [repository]);
   const isEnriching = query.data?.status === "enriching";
+
+  useEffect(() => {
+    if (query.data?.status === "ready") {
+      captureProductEvent("context_ready_viewed", { repository });
+    } else if (query.data?.status === "enriching") {
+      captureProductEvent("fast_result_viewed", { repository });
+    }
+  }, [query.data?.status, repository]);
 
   useEffect(() => {
     if (!isEnriching && query.data?.status !== "ready") return;

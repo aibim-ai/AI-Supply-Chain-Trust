@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -15,6 +15,7 @@ import ScanHeroBackground from "../components/ScanHeroBackground";
 import { PublicContextList } from "../features/repositories/RepositoryViews";
 import { useAsync } from "../hooks/use-async";
 import { trustApi } from "../lib/api-client";
+import { captureProductEvent } from "../lib/posthog";
 import {
   buildSearchCandidates,
   productForInput,
@@ -42,6 +43,7 @@ export default function HomePage() {
     [activeIndex, setActiveIndex] = useState(0),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
+  const inputStarted = useRef(false);
   const syncHome = home.retry;
   const recentRows = rowsFrom(home.data?.recent);
   const product = productForInput(repo);
@@ -109,15 +111,24 @@ export default function HomePage() {
     setSelectedRepo(candidate.repo);
     setDropdownOpen(false);
     setError("");
+    captureProductEvent("repo_candidate_selected", {
+      repository: candidate.repo,
+      has_existing_context: Boolean(candidate.scanned),
+    });
   }
 
   async function queueScan(value) {
     if (!isRepository(value))
       return setError("Search and select a repository first.");
+    captureProductEvent("scan_submitted", {
+      repository: value,
+      has_existing_context: false,
+    });
     setBusy(true);
     setError("");
     try {
       await trustApi.rescan(value);
+      captureProductEvent("scan_queue_accepted", { repository: value });
       navigate(`/r/${value}?scan=queued`);
     } catch (cause) {
       setError(cause.message);
@@ -128,11 +139,23 @@ export default function HomePage() {
 
   async function scanCandidate(candidate) {
     selectCandidate(candidate);
+    if (candidate.scanned) {
+      captureProductEvent("existing_context_opened", {
+        repository: candidate.repo,
+        source: "homepage_search",
+      });
+      navigate(`/r/${candidate.repo}`);
+      return;
+    }
     await queueScan(candidate.repo);
   }
 
   async function submit(event) {
     event.preventDefault();
+    if (selectedCandidate?.scanned) {
+      navigate(`/r/${selectedCandidate.repo}`);
+      return;
+    }
     await queueScan(selectedCandidate?.repo || normalizeRepository(repo));
   }
   function keyDown(event) {
@@ -156,14 +179,14 @@ export default function HomePage() {
         <ScanHeroBackground />
         <div className="scan-hero-headline-overlay" aria-hidden="true" />
         <div className="relative z-10">
-          <span className="eyebrow">Security Context for agents</span>
+          <span className="eyebrow">Public repository due diligence</span>
           <h1>
-            <span>AI Supply Chain</span>
-            <span>Trust</span>
+            <span>Paste a repo. See the evidence,</span>
+            <span>the gaps, and where review should start.</span>
           </h1>
           <p className="hero-subtitle">
-            Paste a public repository. Get a reusable security context and
-            ranked review leads, JSON/Markdown artifacts, and MCP output for
+            Get a traceable public context with repository history, disclosed
+            CVEs, missing evidence, and ranked review leads—for people and
             coding agents.
           </p>
           <form className="hero-scan-form" onSubmit={submit} role="search">
@@ -179,6 +202,10 @@ export default function HomePage() {
                 className="input"
                 value={repo}
                 onChange={(e) => {
+                  if (!inputStarted.current) {
+                    inputStarted.current = true;
+                    captureProductEvent("repo_input_started");
+                  }
                   setRepo(e.target.value);
                   setDropdownOpen(true);
                 }}
@@ -187,7 +214,7 @@ export default function HomePage() {
                   globalThis.setTimeout(() => setDropdownOpen(false), 120)
                 }
                 onKeyDown={keyDown}
-                placeholder="Search repository or paste product link"
+                placeholder="Paste a public GitHub URL or owner/repo"
                 type="search"
                 inputMode="url"
                 autoComplete="url"
@@ -204,7 +231,11 @@ export default function HomePage() {
                   <Spinner />
                 ) : (
                   <>
-                    <span>Scan</span>
+                    <span>
+                      {selectedCandidate?.scanned
+                        ? "View context"
+                        : "Start free scan"}
+                    </span>
                     <ArrowRight size={16} />
                   </>
                 )}
@@ -231,14 +262,68 @@ export default function HomePage() {
                     : "")}
             </p>
           </form>
+          <div className="hero-examples" aria-label="Example repositories">
+            <span>Try an example:</span>
+            {["ollama/ollama", "curl/curl", "rust-lang/rust"].map((example) => (
+              <button
+                type="button"
+                key={example}
+                onClick={() => {
+                  setRepo(example);
+                  setSelectedRepo("");
+                  setDropdownOpen(true);
+                  captureProductEvent("example_repository_selected", {
+                    repository: example,
+                  });
+                }}
+              >
+                {example}
+              </button>
+            ))}
+          </div>
+          <div className="hero-proof" aria-label="Scan terms">
+            <span>Free</span>
+            <span>No account</span>
+            <span>Public results</span>
+          </div>
           <p className="hero-copy">
-            Built for public repository review. Results are public and
-            cacheable; missing evidence is reported as unavailable, not
-            invented.
+            Public repositories only. Missing sources remain visible; results do
+            not replace source review or specialist scanners.
           </p>
         </div>
       </section>
       <HowItWorksPipeline />
+      <section className="home-assurance" aria-labelledby="assurance-title">
+        <div className="home-assurance-heading">
+          <span className="eyebrow">Bounded by evidence</span>
+          <h2 id="assurance-title">
+            Know what the result can—and cannot—tell you.
+          </h2>
+        </div>
+        <div className="home-assurance-grid">
+          <article>
+            <strong>Every result shows its evidence state</strong>
+            <p>
+              Observed, missing, and still-enriching sources remain distinct so
+              unavailable data is not presented as a clean finding.
+            </p>
+          </article>
+          <article>
+            <strong>A review aid, not a replacement</strong>
+            <p>
+              Use the context alongside source review, runtime testing, OpenSSF,
+              SCA, and your organization’s review process.
+            </p>
+          </article>
+          <article>
+            <strong>Public by design</strong>
+            <p>
+              Scans and result URLs are public and cacheable. Do not submit
+              private repository information.
+            </p>
+          </article>
+        </div>
+      </section>
       <section className="home-list-panel">
         <div className="panel-header">
           <div>

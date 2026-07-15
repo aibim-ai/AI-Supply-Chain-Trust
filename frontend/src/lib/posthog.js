@@ -51,3 +51,7 @@ export function withPostHog(callback) {
     window.setTimeout(run, 3000);
   }
 }
+
+export function captureProductEvent(name, properties = {}) {
+  withPostHog((posthog) => posthog.capture(name, properties));
+}

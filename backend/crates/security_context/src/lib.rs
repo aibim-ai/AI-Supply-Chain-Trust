@@ -11,7 +11,7 @@ pub mod top_risks;
 
 pub use context::context_from_report;
 pub use envelope::envelope_from_report;
-pub use evidence::{has_ready_evidence, ready_evidence_summary};
+pub use evidence::{has_ready_evidence, ready_evidence_summary, LIVE_SECURITY_CONTEXT_VERSION};
 pub use fingerprints::fingerprints_from_report;
 pub use leads::leads_from_report;
 pub use regression_contracts::regression_contracts_from_report;

@@ -345,7 +345,6 @@ pub async fn serve(
         .route("/api/v1/admin/discrepancy", get(discrepancy_handler))
         .route("/api/v1/admin/consistency", get(consistency_handler))
         .route("/sitemap.xml", get(sitemap_xml))
-        .route("/free-tools/r/*path", get(security_context_artifact))
         .route("/r/*path", get(security_context_artifact))
         .route("/mcp", get(mcp_info).post(mcp_handler))
         .fallback_service(get(serve_static))
@@ -514,10 +513,20 @@ fn maybe_start_queue_worker(service: Arc<Service>, discovery_token: Option<Strin
     let finalize_service = service.clone();
     let notification_service = service.clone();
     let recovery_service = service.clone();
+    let stale_context_service = service.clone();
     let recovery_interval_secs = env_u64(
         "AI_SUPPLY_CHAIN_TRUST_FAILURE_RECOVERY_INTERVAL_SECONDS",
         600,
     );
+    tokio::spawn(async move {
+        if worker_start_delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(worker_start_delay_secs)).await;
+        }
+        match stale_context_service.enqueue_stale_security_context_rescans(50_000) {
+            Ok(result) => info!(%result, "Stale security contexts queued for precision rescan"),
+            Err(error) => warn!(%error, "Failed to queue stale security-context rescans"),
+        }
+    });
     tokio::spawn(async move {
         if worker_start_delay_secs > 0 {
             tokio::time::sleep(Duration::from_secs(worker_start_delay_secs)).await;
@@ -1521,38 +1530,58 @@ async fn failure_ack_handler(
     }
 }
 
+const SITEMAP_REPOSITORY_LIMIT: usize = 500;
+
 async fn sitemap_xml(State(state): State<AppState>) -> Response {
     let base = state.base_url.trim_end_matches('/');
-    let recent = state.service.recent_scans(50_000);
-    let mut urls = vec![
-        format!("{base}/free-tools/"),
-        format!("{base}/free-tools/contexts"),
-        format!("{base}/free-tools/leaderboard"),
-        format!("{base}/mcp"),
+    let recent = state.service.recent_scans(SITEMAP_REPOSITORY_LIMIT as i64);
+    let core_pages = [
+        ("/", "1.0", "daily"),
+        ("/contexts", "0.9", "daily"),
+        ("/leaderboard", "0.8", "daily"),
+        ("/about", "0.6", "monthly"),
+        ("/editorial-policy", "0.6", "monthly"),
+        ("/privacy", "0.5", "monthly"),
     ];
-
-    if let Some(rows) = recent.get("rows").and_then(Value::as_array) {
-        for row in rows {
-            if let Some(repo) = row.get("repo").and_then(Value::as_str) {
-                let repo = repo.trim_matches('/');
-                if !repo.is_empty() && repo.contains('/') {
-                    urls.push(format!("{base}/free-tools/r/{repo}"));
-                }
-            }
-        }
-    }
-    urls.sort();
-    urls.dedup();
 
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#,
     );
-    for url in urls {
-        xml.push_str("  <url><loc>");
-        xml.push_str(&xml_escape(&url));
-        xml.push_str("</loc></url>\n");
+    for (path, priority, changefreq) in core_pages {
+        append_sitemap_url(
+            &mut xml,
+            &format!("{base}{path}"),
+            None,
+            priority,
+            changefreq,
+        );
+    }
+
+    let mut seen_repositories = std::collections::BTreeSet::new();
+    if let Some(rows) = recent.get("rows").and_then(Value::as_array) {
+        for row in rows.iter().take(SITEMAP_REPOSITORY_LIMIT) {
+            if let Some(repo) = row.get("repo").and_then(Value::as_str) {
+                let repo = repo.trim_matches('/');
+                if !repo.is_empty()
+                    && repo.contains('/')
+                    && seen_repositories.insert(repo.to_ascii_lowercase())
+                {
+                    let lastmod = row
+                        .get("evaluated_at")
+                        .and_then(Value::as_str)
+                        .filter(|value| is_w3c_date(value));
+                    append_sitemap_url(
+                        &mut xml,
+                        &format!("{base}/r/{repo}"),
+                        lastmod,
+                        "0.7",
+                        "weekly",
+                    );
+                }
+            }
+        }
     }
     xml.push_str("</urlset>\n");
 
@@ -1561,6 +1590,38 @@ async fn sitemap_xml(State(state): State<AppState>) -> Response {
         xml,
     )
         .into_response()
+}
+
+fn append_sitemap_url(
+    xml: &mut String,
+    url: &str,
+    lastmod: Option<&str>,
+    priority: &str,
+    changefreq: &str,
+) {
+    xml.push_str("  <url>\n    <loc>");
+    xml.push_str(&xml_escape(url));
+    xml.push_str("</loc>\n");
+    if let Some(lastmod) = lastmod {
+        xml.push_str("    <lastmod>");
+        xml.push_str(lastmod);
+        xml.push_str("</lastmod>\n");
+    }
+    xml.push_str("    <changefreq>");
+    xml.push_str(changefreq);
+    xml.push_str("</changefreq>\n    <priority>");
+    xml.push_str(priority);
+    xml.push_str("</priority>\n  </url>\n");
+}
+
+fn is_w3c_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
 fn xml_escape(value: &str) -> String {
@@ -1759,18 +1820,25 @@ fn prometheus_label_value(value: Option<&str>) -> String {
 }
 
 async fn serve_static(req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
-    let path = req
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .strip_prefix("free-tools/")
-        .or_else(|| {
-            req.uri()
-                .path()
-                .trim_start_matches('/')
-                .strip_prefix("free-tools")
-        })
-        .unwrap_or_else(|| req.uri().path().trim_start_matches('/'));
+    let request_path = req.uri().path();
+    if request_path == "/free-tools" || request_path.starts_with("/free-tools/") {
+        let suffix = request_path.strip_prefix("/free-tools").unwrap_or_default();
+        let mut location = if suffix.is_empty() {
+            "/".to_string()
+        } else {
+            suffix.to_string()
+        };
+        if let Some(query) = req.uri().query() {
+            location.push('?');
+            location.push_str(query);
+        }
+        return axum::response::Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header(header::LOCATION, location)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+    let path = request_path.trim_start_matches('/');
     if !is_safe_static_path(path) {
         return axum::response::Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -1792,10 +1860,7 @@ async fn serve_static(req: axum::http::Request<axum::body::Body>) -> axum::respo
         let content = tokio::fs::read(&file_path).await.unwrap_or_default();
         let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
         let file_name = file_path.file_name().and_then(|v| v.to_str());
-        let is_bundled_asset = path.starts_with("assets/js/")
-            || path.starts_with("assets/css/")
-            || path.starts_with("free-tools/assets/js/")
-            || path.starts_with("free-tools/assets/css/");
+        let is_bundled_asset = path.starts_with("assets/js/") || path.starts_with("assets/css/");
         let cache_control = if file_name == Some("index.html") {
             "no-cache, no-store, must-revalidate"
         } else if is_bundled_asset {
@@ -2358,6 +2423,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_free_tools_routes_redirect_to_canonical_root_paths() {
+        let req = Request::builder()
+            .uri("/free-tools/r/owner/repo?scan=queued")
+            .body(Body::empty())
+            .unwrap();
+        let response = serve_static(req).await;
+
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/r/owner/repo?scan=queued"
+        );
+    }
+
+    #[tokio::test]
     async fn static_routes_reject_parent_directory_traversal() {
         let req = Request::builder()
             .uri("/../Cargo.toml")
@@ -2452,11 +2532,60 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let text = response_text(response).await;
         assert!(text.contains("<urlset"));
-        assert!(text.contains("https://example.test/free-tools/contexts"));
-        assert!(text.contains("https://example.test/free-tools/r/wolfssl/wolfssl"));
-        assert!(text.contains("https://example.test/mcp"));
-        assert!(!text.contains("https://example.test/r/"));
-        assert!(!text.contains("https://example.test/free-tools/docs"));
-        assert!(!text.contains("https://example.test/free-tools/recent-scans"));
+        assert!(text.contains("<loc>https://example.test/</loc>"));
+        assert!(text.contains("<loc>https://example.test/contexts</loc>"));
+        assert!(text.contains("<loc>https://example.test/r/wolfssl/wolfssl</loc>"));
+        assert!(text.contains("<lastmod>2026-07-11</lastmod>"));
+        assert!(text.contains("<priority>1.0</priority>"));
+        assert!(!text.contains("/free-tools"));
+        assert!(!text.contains("https://example.test/mcp"));
+        assert!(!text.contains("https://example.test/recent-scans"));
+    }
+
+    #[tokio::test]
+    async fn sitemap_prioritizes_core_pages_and_limits_repository_inventory() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        for index in 0..=SITEMAP_REPOSITORY_LIMIT {
+            db.insert_report(&json!({
+                "repo": format!("owner/repo-{index}"),
+                "evaluated_at": "2026-07-14",
+                "trust_score": 75.0,
+                "grade": "B",
+                "verdict": "Review",
+                "action": "Review",
+                "next_review_date": "2026-10-12",
+                "coverage": "3/7",
+                "critical_flags": [],
+                "pillar_scores": {},
+                "scanner_runs": [],
+                "observed_metrics": {},
+                "scoring_version": "v1"
+            }))
+            .unwrap();
+        }
+        let state = AppState {
+            service: Arc::new(Service::new(db, None)),
+            base_url: "https://example.test".to_string(),
+            worker_token: None,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
+        };
+
+        let text = response_text(sitemap_xml(State(state)).await).await;
+
+        assert_eq!(
+            text.matches("  <url>\n").count(),
+            SITEMAP_REPOSITORY_LIMIT + 6
+        );
+        assert!(
+            text.find("<loc>https://example.test/</loc>").unwrap()
+                < text
+                    .find("<loc>https://example.test/r/owner/repo-500</loc>")
+                    .unwrap()
+        );
+        assert!(text.contains("/r/owner/repo-500"));
+        assert!(!text.contains("/r/owner/repo-0</loc>"));
     }
 }

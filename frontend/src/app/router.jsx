@@ -41,7 +41,5 @@ export const router = createBrowserRouter(
       ],
     },
   ],
-  {
-    basename: location.pathname.startsWith("/free-tools") ? "/free-tools" : "/",
-  },
+  { basename: "/" },
 );

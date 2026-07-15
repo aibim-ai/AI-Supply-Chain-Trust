@@ -9,7 +9,7 @@ const content = {
   ],
   privacy: [
     "Privacy",
-    "Only public repository inputs are supported. Scan results and generated context are public and may be cached.",
+    "Only public repository inputs are supported. Scan results and generated context are public and may be cached. Google Analytics and PostHog collect site usage data and may use browser storage or cookies; form inputs are masked in session recordings.",
   ],
 };
 export default function LegalPage({ type }) {

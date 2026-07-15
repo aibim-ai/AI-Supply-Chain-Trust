@@ -15,7 +15,7 @@ export function ContextReport({ repository, payload }) {
     fixes = summary.fixes ?? fingerprints.length,
     cveCount = summary.cves ?? cves.length,
     coverage = Number(
-      context.remediation?.coverage ?? summary.regression_coverage ?? 0,
+      context.remediation?.coverage ?? summary.remediation_coverage ?? 0,
     ),
     covered = Math.max(0, Math.min(34, Math.round((coverage / 100) * 34))),
     classCounts =

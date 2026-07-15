@@ -404,6 +404,13 @@ fn service_config_from_env() -> ServiceConfig {
         .and_then(|value| value.parse().ok())
         .filter(|value: &usize| *value > 0)
         .unwrap_or_else(|| ServiceConfig::default().progressive_history_max_pages),
+        scanner_enabled: !matches!(
+            std::env::var("AI_SUPPLY_CHAIN_TRUST_SCANNER_MODE")
+                .unwrap_or_else(|_| "sync".into())
+                .to_ascii_lowercase()
+                .as_str(),
+            "off" | "disabled" | "none"
+        ),
     }
 }
 

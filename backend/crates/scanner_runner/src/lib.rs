@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Scanner registry
@@ -75,6 +75,7 @@ pub struct ScannerResult {
 pub struct ScannerRunner {
     pub repo_url: String,
     pub source_path: Option<String>,
+    pub github_token: Option<String>,
 }
 
 impl ScannerRunner {
@@ -82,11 +83,17 @@ impl ScannerRunner {
         Self {
             repo_url: repo_url.into(),
             source_path: None,
+            github_token: None,
         }
     }
 
     pub fn with_source(mut self, path: impl Into<String>) -> Self {
         self.source_path = Some(path.into());
+        self
+    }
+
+    pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(token.into());
         self
     }
 
@@ -139,11 +146,18 @@ impl ScannerRunner {
     // Scorecard: scorecard --repo={url} --format=json
     // -------------------------------------------------------------------
     async fn run_scorecard(&self) -> anyhow::Result<(String, String, Option<Value>)> {
+        let auth_env = self
+            .github_token
+            .as_deref()
+            .map(|token| vec![("GITHUB_AUTH_TOKEN", token)])
+            .unwrap_or_default();
         let output = run_cmd(
             "scorecard",
             &["--repo", &self.repo_url, "--format", "json"],
             ScannerTool::Scorecard.timeout_seconds(),
-        )?;
+            &auth_env,
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         Ok((
@@ -157,19 +171,20 @@ impl ScannerRunner {
     // Gitleaks: gitleaks detect --source={path} --no-git -f json
     // -------------------------------------------------------------------
     async fn run_gitleaks(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
-        if !Path::new(path).exists() {
+        let Some(path) = self.available_source() else {
             return Ok((
                 "skipped".into(),
                 "No source directory available for gitleaks".into(),
                 None,
             ));
-        }
+        };
         let output = run_cmd(
             "gitleaks",
             &["detect", "--source", path, "--no-git", "-f", "json"],
             ScannerTool::Gitleaks.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         if output.trim().is_empty() {
             return Ok(("ok".into(), "No secrets found".into(), Some(json!([]))));
         }
@@ -186,7 +201,13 @@ impl ScannerRunner {
     // pip-audit: pip-audit -r {requirements} -f json
     // -------------------------------------------------------------------
     async fn run_pip_audit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
+        let Some(path) = self.available_source() else {
+            return Ok((
+                "skipped".into(),
+                "No source directory available".into(),
+                None,
+            ));
+        };
         let req = find_file(path, &["requirements.txt", "pyproject.toml", "setup.py"]);
         let Some(req) = req else {
             return Ok(("skipped".into(), "No Python manifest found".into(), None));
@@ -195,7 +216,9 @@ impl ScannerRunner {
             "pip-audit",
             &["-r", &req, "-f", "json"],
             ScannerTool::PipAudit.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let vulns = json
             .get("vulnerabilities")
@@ -213,7 +236,13 @@ impl ScannerRunner {
     // npm audit: npm audit --json --prefix {path}
     // -------------------------------------------------------------------
     async fn run_npm_audit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
+        let Some(path) = self.available_source() else {
+            return Ok((
+                "skipped".into(),
+                "No source directory available".into(),
+                None,
+            ));
+        };
         let pkg = find_file(path, &["package.json"]);
         let Some(_pkg) = pkg else {
             return Ok(("skipped".into(), "No package.json found".into(), None));
@@ -222,7 +251,9 @@ impl ScannerRunner {
             "npm",
             &["audit", "--json", "--prefix", path],
             ScannerTool::NpmAudit.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let vulns = json
             .get("metadata")
@@ -241,12 +272,20 @@ impl ScannerRunner {
     // Semgrep: semgrep --config=auto --json {path}
     // -------------------------------------------------------------------
     async fn run_semgrep(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
+        let Some(path) = self.available_source() else {
+            return Ok((
+                "skipped".into(),
+                "No source directory available".into(),
+                None,
+            ));
+        };
         let output = run_cmd(
             "semgrep",
             &["--config=auto", "--json", path],
             ScannerTool::Semgrep.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let findings = json
             .get("results")
@@ -264,12 +303,20 @@ impl ScannerRunner {
     // Bandit: bandit -r {path} -f json
     // -------------------------------------------------------------------
     async fn run_bandit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
+        let Some(path) = self.available_source() else {
+            return Ok((
+                "skipped".into(),
+                "No source directory available".into(),
+                None,
+            ));
+        };
         let output = run_cmd(
             "bandit",
             &["-r", path, "-f", "json"],
             ScannerTool::Bandit.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let issues = json
             .get("results")
@@ -283,7 +330,13 @@ impl ScannerRunner {
     // Trivy: trivy fs --scanners vuln,secret,misconfig -f json {path}
     // -------------------------------------------------------------------
     async fn run_trivy(&self) -> anyhow::Result<(String, String, Option<Value>)> {
-        let path = self.source_path.as_deref().unwrap_or(".");
+        let Some(path) = self.available_source() else {
+            return Ok((
+                "skipped".into(),
+                "No source directory available".into(),
+                None,
+            ));
+        };
         let output = run_cmd(
             "trivy",
             &[
@@ -295,7 +348,9 @@ impl ScannerRunner {
                 path,
             ],
             ScannerTool::Trivy.timeout_seconds(),
-        )?;
+            &[],
+        )
+        .await?;
         let json: Value = serde_json::from_str(&output)?;
         let results = json
             .get("Results")
@@ -308,17 +363,33 @@ impl ScannerRunner {
             Some(json),
         ))
     }
+
+    fn available_source(&self) -> Option<&str> {
+        self.source_path
+            .as_deref()
+            .filter(|path| Path::new(path).exists())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-fn run_cmd(binary: &str, args: &[&str], _timeout_secs: u64) -> anyhow::Result<String> {
-    let output = Command::new(binary)
+async fn run_cmd(
+    binary: &str,
+    args: &[&str],
+    timeout_secs: u64,
+    env: &[(&str, &str)],
+) -> anyhow::Result<String> {
+    let mut command = tokio::process::Command::new(binary);
+    command
         .args(args)
+        .envs(env.iter().copied())
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{binary} timed out after {timeout_secs}s"))?
         .map_err(|e| anyhow::anyhow!("Failed to execute {binary}: {e}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -392,8 +463,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_lookup_and_command_execution_report_success_and_failure() {
+    #[tokio::test]
+    async fn file_lookup_and_command_execution_report_success_and_failure() {
         let root = std::env::temp_dir().join(format!("scanner-runner-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("package.json"), "{}").unwrap();
@@ -402,8 +473,12 @@ mod tests {
             find_file(root.to_str().unwrap(), &["missing", "package.json"]),
             Some(root.join("package.json").to_string_lossy().to_string())
         );
-        assert_eq!(run_cmd("printf", &["scanner-ok"], 1).unwrap(), "scanner-ok");
-        assert!(run_cmd("false", &[], 1)
+        assert_eq!(
+            run_cmd("printf", &["scanner-ok"], 1, &[]).await.unwrap(),
+            "scanner-ok"
+        );
+        assert!(run_cmd("false", &[], 1, &[])
+            .await
             .unwrap_err()
             .to_string()
             .contains("failed"));

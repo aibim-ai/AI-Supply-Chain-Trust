@@ -5,6 +5,7 @@ use ai_supply_chain_trust_evaluator::{evaluate_repository, EvidenceSources};
 use ai_supply_chain_trust_intelligence::{IntelligenceClient, IntelligenceClientConfig};
 use ai_supply_chain_trust_models::scanner::ScannerStatus;
 use ai_supply_chain_trust_models::{EvaluationResult, ScannerRun};
+use ai_supply_chain_trust_scanner_runner::{ScannerResult, ScannerRunner};
 use ai_supply_chain_trust_scoring::pillar_weight;
 use ai_supply_chain_trust_security_context::{
     envelope_from_report, regression_contracts_from_report,
@@ -35,6 +36,7 @@ pub struct ServiceConfig {
     pub foreground_timeout_seconds: u64,
     pub nvd_task_timeout_seconds: u64,
     pub progressive_history_max_pages: usize,
+    pub scanner_enabled: bool,
 }
 
 impl Default for ServiceConfig {
@@ -46,6 +48,7 @@ impl Default for ServiceConfig {
             foreground_timeout_seconds: 5,
             nvd_task_timeout_seconds: 90,
             progressive_history_max_pages: 10,
+            scanner_enabled: true,
         }
     }
 }
@@ -199,38 +202,13 @@ impl Service {
         let intel_head_sha = intel_result.as_ref().ok().and_then(|r| r.head_sha.clone());
 
         // 3. Build evidence sources — enrich with external scanners
-        let scanner_results: Option<Vec<ai_supply_chain_trust_scanner_runner::ScannerResult>> =
-            None;
-
-        let scanner_runs: Vec<ScannerRun> = scanner_results
-            .as_ref()
-            .map(|results| {
-                results
-                    .iter()
-                    .map(|r| ScannerRun {
-                        tool: r.tool.clone(),
-                        status: match r.status.as_str() {
-                            "ok" => ScannerStatus::Ok,
-                            "skipped" => ScannerStatus::Skipped,
-                            "failed" => ScannerStatus::Failed,
-                            _ => ScannerStatus::Unavailable,
-                        },
-                        detail: r.detail.clone(),
-                        impact: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let tool_outputs: std::collections::HashMap<String, Value> = scanner_results
-            .as_ref()
-            .map(|results| {
-                results
-                    .iter()
-                    .filter_map(|r| r.output.clone().map(|o| (r.tool.clone(), o)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let scanner_evidence = if progressive {
+            ScannerEvidence::default()
+        } else {
+            self.collect_scanner_evidence(repo).await
+        };
+        let scanner_runs = scanner_evidence.runs;
+        let tool_outputs = scanner_evidence.outputs;
 
         let evidence_sources = EvidenceSources {
             github_metadata: enriched.clone(),
@@ -452,6 +430,17 @@ impl Service {
             );
         }
         metadata
+    }
+
+    async fn collect_scanner_evidence(&self, repo: &str) -> ScannerEvidence {
+        if !self.config.scanner_enabled {
+            return ScannerEvidence::default();
+        }
+        let mut runner = ScannerRunner::new(format!("https://github.com/{repo}"));
+        if let Some(token) = self.github_token.as_deref() {
+            runner = runner.with_github_token(token);
+        }
+        scanner_evidence_from_results(runner.run_all().await)
     }
 
     // -----------------------------------------------------------------------
@@ -1383,10 +1372,14 @@ impl Service {
                 prepared.evaluation_id
             ));
         }
+        let scanner_evidence = self.collect_scanner_evidence(&prepared.repo).await;
+        report["scanner_runs"] = serde_json::to_value(&scanner_evidence.runs)
+            .map_err(|error| format!("scanner result serialization failed: {error}"))?;
         if let Some(metrics) = report
             .get_mut("observed_metrics")
             .and_then(Value::as_object_mut)
         {
+            metrics.insert("scanner_outputs".into(), json!(scanner_evidence.outputs));
             let (history_head_sha, history_commit_count) =
                 history_identity_from_pages(&prepared.history_pages);
             if let Some(intel) = metrics
@@ -1729,6 +1722,35 @@ fn primary_github_token(tokens: Option<&str>) -> Option<String> {
     })
 }
 
+#[derive(Default)]
+struct ScannerEvidence {
+    runs: Vec<ScannerRun>,
+    outputs: HashMap<String, Value>,
+}
+
+fn scanner_evidence_from_results(results: Vec<ScannerResult>) -> ScannerEvidence {
+    let runs = results
+        .iter()
+        .map(|result| ScannerRun {
+            tool: result.tool.clone(),
+            status: match result.status.as_str() {
+                "ok" => ScannerStatus::Ok,
+                "skipped" => ScannerStatus::Skipped,
+                "failed" => ScannerStatus::Failed,
+                "partial" => ScannerStatus::Partial,
+                _ => ScannerStatus::Unavailable,
+            },
+            detail: result.detail.clone(),
+            impact: None,
+        })
+        .collect();
+    let outputs = results
+        .into_iter()
+        .filter_map(|result| result.output.map(|output| (result.tool, output)))
+        .collect();
+    ScannerEvidence { runs, outputs }
+}
+
 fn sanitize_public_job(mut job: Value) -> Value {
     if let Some(object) = job.as_object_mut() {
         object.remove("last_error");
@@ -1884,6 +1906,32 @@ mod tests {
             history_identity_from_pages(&pages),
             (Some("abc123".to_string()), 102)
         );
+    }
+
+    #[test]
+    fn scanner_results_are_mapped_to_evidence_without_promoting_failures() {
+        let evidence = scanner_evidence_from_results(vec![
+            ScannerResult {
+                tool: "scorecard".into(),
+                status: "ok".into(),
+                detail: "Scorecard score: 8.0/10".into(),
+                output: Some(json!({"score": 8.0})),
+                duration_ms: 10,
+            },
+            ScannerResult {
+                tool: "semgrep".into(),
+                status: "unavailable".into(),
+                detail: "binary unavailable".into(),
+                output: None,
+                duration_ms: 0,
+            },
+        ]);
+
+        assert_eq!(evidence.runs.len(), 2);
+        assert_eq!(evidence.runs[0].status, ScannerStatus::Ok);
+        assert_eq!(evidence.runs[1].status, ScannerStatus::Unavailable);
+        assert_eq!(evidence.outputs["scorecard"]["score"], json!(8.0));
+        assert!(!evidence.outputs.contains_key("semgrep"));
     }
     use ai_supply_chain_trust_models::{Grade, PillarResult};
     use chrono::NaiveDate;

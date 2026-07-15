@@ -49,13 +49,13 @@ describe("HomePage", () => {
 
     expect(
       screen.getByRole("heading", {
-        name: "Evidence moves. Trust stays explainable.",
+        name: "From repository to trusted context.",
       }),
     ).toBeTruthy();
     expect(screen.getByRole("list", { name: "Trust pipeline" })).toBeTruthy();
     expect(screen.getByText("Bounded LLM assist")).toBeTruthy();
-    expect(screen.getByText("Gemma when available")).toBeTruthy();
-    expect(screen.getByText("accept or rule fallback")).toBeTruthy();
+    expect(screen.getByText("Optional")).toBeTruthy();
+    expect(screen.getByText("Web · JSON · MCP")).toBeTruthy();
   });
 
   it("queues the selected search result and navigates to scan progress", async () => {

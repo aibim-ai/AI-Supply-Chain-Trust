@@ -12,11 +12,15 @@ COPY bin/ bin/
 RUN cargo build --release -p ai-supply-chain-trust && \
     strip /app/target/release/ai-supply-chain-trust
 
+FROM golang:1.25-bookworm AS scorecard-builder
+RUN GOBIN=/out go install github.com/ossf/scorecard/v5@v5.3.0
+
 # --- Runtime stage ---
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ai-supply-chain-trust /usr/local/bin/ai-supply-chain-trust
+COPY --from=scorecard-builder /out/scorecard /usr/local/bin/scorecard
 
 RUN mkdir -p /data && chmod 777 /data
 

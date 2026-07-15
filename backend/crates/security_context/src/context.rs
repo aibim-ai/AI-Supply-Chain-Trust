@@ -319,7 +319,12 @@ fn scanner_run_count(report: &Value) -> i64 {
     report
         .get("scanner_runs")
         .and_then(Value::as_array)
-        .map_or(0, Vec::len) as i64
+        .map(|runs| {
+            runs.iter()
+                .filter(|run| run.get("status").and_then(Value::as_str) == Some("ok"))
+                .count()
+        })
+        .unwrap_or(0) as i64
 }
 
 fn shared_surfaces(report: &Value) -> Value {
@@ -476,10 +481,23 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_scanners_do_not_create_false_coverage() {
+        let report = json!({
+            "scanner_runs": [{"tool": "scorecard", "status": "unavailable"}],
+            "observed_metrics": {"security_intel": {"fix_commits": [{
+                "sha": "1111111111", "subject": "security fix", "component": "src/lib.rs",
+                "vuln_class": "Security Fix", "severity": "medium"
+            }]}}
+        });
+
+        assert_eq!(coverage_percent(&report), 0.0);
+    }
+
+    #[test]
     fn remediation_coverage_uses_cve_ratio_when_guarded() {
         let report = json!({
             "scanner_runs": [
-                { "tool": "scanner-a" }
+                { "tool": "scanner-a", "status": "ok" }
             ],
             "observed_metrics": {
                 "security_intel": {

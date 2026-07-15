@@ -267,7 +267,7 @@ impl Service {
             metrics.insert("security_intel".into(), intel_json);
             metrics.insert(
                 "security_context_version".into(),
-                json!(ai_repo_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION),
+                json!(ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION),
             );
             metrics.insert(
                 "verification_status".into(),
@@ -1003,7 +1003,9 @@ impl Service {
                 .get("observed_metrics")
                 .and_then(|metrics| metrics.get("security_context_version"))
                 .and_then(Value::as_str);
-            if version == Some(ai_repo_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION) {
+            if version
+                == Some(ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION)
+            {
                 continue;
             }
 
@@ -1020,7 +1022,7 @@ impl Service {
             "stale": stale_repos.len(),
             "repos": stale_repos,
             "job_ids": job_ids,
-            "target_version": ai_repo_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION
+            "target_version": ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION
         }))
     }
     pub async fn run_progressive_scan(&self, repo: &str) -> Result<(i64, Value), String> {
@@ -2032,7 +2034,7 @@ mod tests {
 
     #[test]
     fn stale_security_contexts_are_requeued_in_the_background() {
-        let db = Arc::new(ai_repo_trust_storage::Database::open_memory().unwrap());
+        let db = Arc::new(ai_supply_chain_trust_storage::Database::open_memory().unwrap());
         let svc = Service::new(db.clone(), None);
         let current = make_report("owner/current");
         let mut stale = make_report("owner/stale");

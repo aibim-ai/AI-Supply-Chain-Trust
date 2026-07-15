@@ -2569,6 +2569,8 @@ mod tests {
             worker_token: None,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
             feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
         };
 
         let text = response_text(sitemap_xml(State(state)).await).await;

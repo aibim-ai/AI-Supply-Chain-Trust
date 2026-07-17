@@ -7,7 +7,6 @@ import {
   ExternalLink,
   FileText,
   History,
-  MoreHorizontal,
   Search,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -223,17 +222,14 @@ export function ContextReport({ repository, payload }) {
             id="context-actions-panel"
             data-open={actionsOpen}
           >
-            {primaryContextActions()}
+            <div className="sc-primary-context-actions">
+              {primaryContextActions()}
+            </div>
             {Object.keys(payload.artifacts || {}).length > 0 && (
-              <details className="sc-action-more">
-                <summary>
-                  <MoreHorizontal size={16} /> More
-                </summary>
-                <div className="sc-action-popover">
-                  <span>Export context</span>
-                  {artifactButtons(payload.artifacts)}
-                </div>
-              </details>
+              <div className="sc-action-popover sc-export-actions">
+                <span>Export context</span>
+                {artifactButtons(payload.artifacts)}
+              </div>
             )}
           </div>
         </nav>
@@ -380,6 +376,9 @@ export function ContextReport({ repository, payload }) {
             ) : (
               <small>No security fixes to measure.</small>
             )}
+            <span className="sc-last-analyzed">
+              Last analyzed {formatDate(generated)}
+            </span>
           </div>
         </aside>
         <div className="sc-brief">
@@ -415,10 +414,6 @@ export function ContextReport({ repository, payload }) {
             <PatternList risks={context.top_risks || []} />
           </div>
         </div>
-        <footer className="sc-footer">
-          <span>Last analyzed {formatDate(generated)}</span>
-          <div>{artifactButtons(payload.artifacts)}</div>
-        </footer>
       </section>
       <section
         className="sc-section sc-review-leads"

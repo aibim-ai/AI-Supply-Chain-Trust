@@ -2911,6 +2911,8 @@ th {
 }
 
 .sc-title {
+  position: relative;
+  z-index: 40;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2922,14 +2924,21 @@ th {
 }
 
 .sc-title-actions,
-.sc-title-actions-inline {
+.sc-title-actions-inline,
+.sc-primary-context-actions {
   display: flex;
   align-items: center;
   gap: 7px;
 }
 
 .sc-title-actions {
+  position: relative;
+  z-index: 1;
   flex: 0 0 auto;
+}
+
+.sc-title-actions-inline {
+  order: 1;
 }
 
 .sc-title-actions button,
@@ -2967,23 +2976,6 @@ th {
 
 .sc-title-actions button:first-child:hover {
   background: var(--text2);
-}
-
-.sc-action-more {
-  position: relative;
-}
-
-.sc-action-more summary {
-  cursor: pointer;
-  list-style: none;
-}
-
-.sc-action-more summary::-webkit-details-marker {
-  display: none;
-}
-
-.sc-action-more[open] summary {
-  border-color: var(--ink);
 }
 
 .sc-action-popover {
@@ -3032,7 +3024,16 @@ th {
 }
 
 .sc-action-menu-trigger {
+  order: 2;
+  display: inline-flex;
+}
+
+.sc-export-actions {
   display: none;
+}
+
+.sc-title-actions-inline[data-open="true"] .sc-export-actions {
+  display: grid;
 }
 
 .feedback-rail {
@@ -3412,6 +3413,16 @@ th {
 .sc-watch small {
   color: var(--muted);
   font-family: var(--font-mono);
+}
+
+.sc-last-analyzed {
+  display: block;
+  margin-top: 9px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .sc-brief {
@@ -4293,34 +4304,35 @@ th {
   }
 
   .sc-action-menu-trigger {
-    display: inline-flex;
     min-width: 92px;
   }
 
-  .sc-title-actions-inline > button,
-  .sc-title-actions-inline > a,
-  .sc-title-actions-inline > details,
-  .sc-title-actions-inline > details > summary {
+  .sc-primary-context-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sc-primary-context-actions > button,
+  .sc-primary-context-actions > a {
     justify-content: flex-start;
     width: 100%;
   }
 
-  .sc-title-actions-inline > button,
-  .sc-title-actions-inline > a,
-  .sc-title-actions-inline > details > summary {
+  .sc-primary-context-actions > button,
+  .sc-primary-context-actions > a {
     border-color: transparent;
     background: transparent;
     color: var(--ink);
   }
 
-  .sc-title-actions-inline > button:hover,
-  .sc-title-actions-inline > a:hover,
-  .sc-title-actions-inline > details > summary:hover {
+  .sc-primary-context-actions > button:hover,
+  .sc-primary-context-actions > a:hover {
     background: var(--bg-subtle);
   }
 
-  .sc-title-actions-inline .sc-action-popover {
+  .sc-title-actions-inline .sc-export-actions {
     position: static;
+    display: grid;
     width: 100%;
     min-width: 0;
     margin-top: 4px;

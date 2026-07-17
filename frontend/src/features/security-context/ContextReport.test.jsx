@@ -143,6 +143,9 @@ describe("ContextReport", () => {
     expect(html).toContain("sc-decision-hub");
     expect(html).toContain('aria-label="Context actions"');
     expect(html).not.toContain("sc-feedback-button");
+    expect(html).toContain("sc-last-analyzed");
+    expect(html).toContain("Last analyzed Jul 10, 2026");
+    expect(html).not.toContain("sc-footer");
     expect(html).toContain(
       "https://github.com/example/repo/commit/abcdef1234567890",
     );

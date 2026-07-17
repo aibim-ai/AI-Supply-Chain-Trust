@@ -35,6 +35,18 @@ describe("mobile layout contract", () => {
     );
   });
 
+  it("anchors the compact context action menu above following panels", () => {
+    expect(responsiveCss).toMatch(
+      /\.sc-title\s*\{[\s\S]*?position: relative;[\s\S]*?z-index: 40/,
+    );
+    expect(responsiveCss).toMatch(
+      /\.sc-title-actions\s*\{[\s\S]*?position: relative;[\s\S]*?z-index: 1/,
+    );
+    expect(responsiveCss).toMatch(
+      /\.sc-title-actions-inline\[data-open="true"\][\s\S]*?display: flex/,
+    );
+  });
+
   it("keeps compact screens within the viewport", () => {
     expect(responsiveCss).toMatch(/html,[\s\S]*body[\s\S]*overflow-x: clip/);
     expect(responsiveCss).toMatch(

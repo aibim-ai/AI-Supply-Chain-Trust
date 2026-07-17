@@ -289,12 +289,13 @@ function ScannerTable({ rows }) {
   return (
     <div className="table-shell">
       <table>
+        <caption className="sr-only">Scanner execution results</caption>
         <thead>
           <tr>
-            <th>Tool</th>
-            <th>Status</th>
-            <th>Detail</th>
-            <th>Impact</th>
+            <th scope="col">Tool</th>
+            <th scope="col">Status</th>
+            <th scope="col">Detail</th>
+            <th scope="col">Impact</th>
           </tr>
         </thead>
         <tbody>

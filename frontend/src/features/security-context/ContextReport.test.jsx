@@ -1,5 +1,7 @@
+// @vitest-environment jsdom
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextReport } from "./ContextReport";
 
 const payload = {
@@ -119,6 +121,8 @@ const payload = {
 };
 
 describe("ContextReport", () => {
+  afterEach(cleanup);
+
   it("renders a ready security context report with legacy sections", () => {
     const html = renderToStaticMarkup(
       <ContextReport repository="example/repo" payload={payload} />,
@@ -135,6 +139,10 @@ describe("ContextReport", () => {
     expect(html).toContain("Review parser length handling");
     expect(html).toContain("Copy public link");
     expect(html).toContain("Copy MCP query");
+    expect(html).toContain("Scan another repository");
+    expect(html).toContain("sc-decision-hub");
+    expect(html).toContain('aria-label="Context actions"');
+    expect(html).not.toContain("sc-feedback-button");
     expect(html).toContain(
       "https://github.com/example/repo/commit/abcdef1234567890",
     );
@@ -152,6 +160,11 @@ describe("ContextReport", () => {
     expect(html).toContain("check: action_required");
     expect(html).toContain('data-label="Protected surface"');
     expect(html).toContain('data-label="Vulnerability"');
+    expect(html).toContain("Column focus");
+    expect(html).toContain('data-focus="balanced"');
+    expect(html).toContain('scope="col"');
+    expect(html).toContain("Regression contracts, protected surfaces");
+    expect(html).toContain('role="region"');
     expect(html).not.toContain("Guard parser");
   });
 
@@ -174,5 +187,45 @@ describe("ContextReport", () => {
     expect(html).toContain("Show all regression contracts");
     expect(html).toContain("(2 more)");
     expect(html).toContain("sc-watch-continuation");
+  });
+
+  it("lets touch and keyboard users focus a dense watchlist column", () => {
+    const originalFrame = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = (callback) => callback();
+    const { container, getByRole } = render(
+      <ContextReport repository="example/repo" payload={payload} />,
+    );
+    const shell = container.querySelector(
+      '[aria-label="Regression watchlist table"]',
+    );
+    shell.scrollTo = vi.fn();
+
+    fireEvent.click(getByRole("button", { name: "Surface" }));
+
+    expect(container.querySelector(".sc-watch").dataset.focus).toBe("surface");
+    expect(
+      getByRole("button", { name: "Surface" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(shell.scrollTo).toHaveBeenCalledWith(
+      expect.objectContaining({ behavior: "smooth" }),
+    );
+    globalThis.requestAnimationFrame = originalFrame;
+  });
+
+  it("exposes one responsive context action set through the compact trigger", () => {
+    const { getAllByRole, getByRole, container } = render(
+      <ContextReport repository="example/repo" payload={payload} />,
+    );
+    const trigger = getByRole("button", { name: "Actions" });
+
+    expect(getAllByRole("button", { name: "Copy public link" })).toHaveLength(
+      1,
+    );
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector("#context-actions-panel").dataset.open).toBe(
+      "true",
+    );
   });
 });

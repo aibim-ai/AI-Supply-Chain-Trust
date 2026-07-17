@@ -60,7 +60,7 @@ describe("ContextReport analytics", () => {
     await user.click(screen.getByRole("button", { name: "Copy public link" }));
     expect(analytics.capture).toHaveBeenCalledWith("public_context_shared", {
       share_method: "copy_link",
-      share_surface: "context_utility_bar",
+      share_surface: "context_title_actions",
     });
 
     const artifactLink = screen.getAllByLabelText("security context json")[0];

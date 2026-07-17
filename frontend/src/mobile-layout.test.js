@@ -19,6 +19,20 @@ describe("mobile layout contract", () => {
     expect(responsiveCss).toMatch(
       /\.sc-watch,[\s\S]*\.sc-fixes[\s\S]*min-width: 0/,
     );
+    expect(responsiveCss).toMatch(
+      /@media \(max-width: 480px\)[\s\S]*grid-template-columns: 1fr/,
+    );
+  });
+
+  it("supports adaptive column focus without forcing hover on touch", () => {
+    expect(responsiveCss).toMatch(
+      /@media \(hover: hover\) and \(pointer: fine\) and \(min-width: 1121px\)/,
+    );
+    expect(responsiveCss).toMatch(/\.sc-watch\[data-focus="contract"\]/);
+    expect(responsiveCss).toMatch(/transition: width 220ms/);
+    expect(responsiveCss).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)[\s\S]*transition: none/,
+    );
   });
 
   it("keeps compact screens within the viewport", () => {

@@ -1,22 +1,25 @@
 import {
   Bot,
   Braces,
+  ChevronDown,
   CircleAlert,
   Copy,
   ExternalLink,
   FileText,
   History,
-  MessageSquare,
+  MoreHorizontal,
   Search,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { openFeedback } from "../../components/FeedbackWidget";
 import { captureProductEvent } from "../../lib/posthog";
 
 export function ContextReport({ repository, payload }) {
   const [filter, setFilter] = useState("default");
+  const [watchColumn, setWatchColumn] = useState("balanced");
   const [copied, setCopied] = useState("");
+  const [actionsOpen, setActionsOpen] = useState(false);
   const reportRef = useRef(null);
+  const watchShellRef = useRef(null);
   const context = payload.context || {},
     summary = payload.summary || {};
   const trust = context.trust || payload.trust_decision || {};
@@ -131,6 +134,70 @@ export function ContextReport({ repository, payload }) {
     }
   }
 
+  function focusWatchColumn(value, columnIndex) {
+    setWatchColumn(value);
+    const shell = watchShellRef.current;
+    if (!shell) return;
+    globalThis.requestAnimationFrame(() => {
+      if (value === "balanced") {
+        shell.scrollTo({ left: 0, behavior: motionPreference() });
+        return;
+      }
+      const header = shell.querySelectorAll("th")[columnIndex];
+      if (!header) return;
+      const centered =
+        header.offsetLeft - (shell.clientWidth - header.offsetWidth) / 2;
+      shell.scrollTo({
+        left: Math.max(0, centered),
+        behavior: motionPreference(),
+      });
+    });
+  }
+
+  function primaryContextActions() {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            setActionsOpen(false);
+            copyAction("public_context_shared", publicUrl, {
+              share_method: "copy_link",
+              share_surface: "context_title_actions",
+            });
+          }}
+        >
+          <Copy size={15} />
+          {copied === "public_context_shared"
+            ? "Link copied"
+            : "Copy public link"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setActionsOpen(false);
+            copyAction(
+              "mcp_config_copied",
+              `Use ${globalThis.window?.location?.origin || "https://ai-supply-chain-trust.aibim.ai"}/mcp to inspect ${repository}. Begin with evidence gaps, historical fixes or CVEs, and ranked review leads.`,
+              {
+                mcp_client: "generic_query",
+                navigation_surface: "context_title_actions",
+              },
+            );
+          }}
+        >
+          <Bot size={15} />
+          {copied === "mcp_config_copied"
+            ? "MCP query copied"
+            : "Copy MCP query"}
+        </button>
+        <a className="sc-new-scan" href="/">
+          <Search size={15} /> Scan another repository
+        </a>
+      </>
+    );
+  }
+
   return (
     <section className="securitycontext-page" ref={reportRef}>
       <div className="sc-title">
@@ -141,123 +208,107 @@ export function ContextReport({ repository, payload }) {
             vuln in this repo.
           </p>
         </div>
-        <button
-          className="button button-secondary sc-feedback-button"
-          type="button"
-          onClick={() => openFeedback(repository)}
-        >
-          <MessageSquare size={15} /> Feedback
-        </button>
+        <nav className="sc-title-actions" aria-label="Context actions">
+          <button
+            className="sc-action-menu-trigger"
+            type="button"
+            aria-expanded={actionsOpen}
+            aria-controls="context-actions-panel"
+            onClick={() => setActionsOpen((current) => !current)}
+          >
+            Actions <ChevronDown size={16} />
+          </button>
+          <div
+            className="sc-title-actions-inline"
+            id="context-actions-panel"
+            data-open={actionsOpen}
+          >
+            {primaryContextActions()}
+            {Object.keys(payload.artifacts || {}).length > 0 && (
+              <details className="sc-action-more">
+                <summary>
+                  <MoreHorizontal size={16} /> More
+                </summary>
+                <div className="sc-action-popover">
+                  <span>Export context</span>
+                  {artifactButtons(payload.artifacts)}
+                </div>
+              </details>
+            )}
+          </div>
+        </nav>
       </div>
-      <nav className="sc-utility-bar" aria-label="Reuse this context">
-        <button
-          type="button"
-          onClick={() =>
-            copyAction("public_context_shared", publicUrl, {
-              share_method: "copy_link",
-              share_surface: "context_utility_bar",
-            })
-          }
-        >
-          <Copy size={15} />
-          {copied === "public_context_shared"
-            ? "Link copied"
-            : "Copy public link"}
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            copyAction(
-              "mcp_config_copied",
-              `Use ${globalThis.window?.location?.origin || "https://ai-supply-chain-trust.aibim.ai"}/mcp to inspect ${repository}. Begin with evidence gaps, historical fixes or CVEs, and ranked review leads.`,
-              {
-                mcp_client: "generic_query",
-                navigation_surface: "context_report",
-              },
-            )
-          }
-        >
-          <Bot size={15} />
-          {copied === "mcp_config_copied"
-            ? "MCP query copied"
-            : "Copy MCP query"}
-        </button>
-        <a className="sc-new-scan" href="/">
-          Scan another repository
-        </a>
-        <div className="sc-utility-artifacts">
-          {artifactButtons(payload.artifacts)}
-        </div>
-      </nav>
-      <section className="sc-decision">
-        <div className="sc-decision-copy">
-          <span className="eyebrow">Decision support</span>
-          <h2>
-            {trust.label || payload.verdict || "Evidence review required"}
-          </h2>
-          <p>
-            {trust.action || payload.action || "Review evidence before use."}
-          </p>
-          {decisionReasons.length > 0 && (
-            <div className="sc-decision-reasons">
-              {decisionReasons.map((reason) => (
-                <span data-state={reason.state} key={reason.text}>
-                  {reason.text}
-                </span>
-              ))}
+      <section className="sc-decision-hub">
+        <div className="sc-decision">
+          <div className="sc-decision-copy">
+            <span className="eyebrow">Decision support</span>
+            <h2>
+              {trust.label || payload.verdict || "Evidence review required"}
+            </h2>
+            <p>
+              {trust.action || payload.action || "Review evidence before use."}
+            </p>
+            {decisionReasons.length > 0 && (
+              <div className="sc-decision-reasons">
+                {decisionReasons.map((reason) => (
+                  <span data-state={reason.state} key={reason.text}>
+                    {reason.text}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <dl>
+            <div>
+              <dt>Score</dt>
+              <dd>
+                {Math.round(Number(trust.score ?? payload.trust_score ?? 0))}
+              </dd>
             </div>
-          )}
+            <div>
+              <dt>Grade</dt>
+              <dd>{trust.grade || payload.grade || "-"}</dd>
+            </div>
+            <div>
+              <dt>Confidence</dt>
+              <dd>{trust.confidence || payload.confidence || "unknown"}</dd>
+            </div>
+            <div>
+              <dt>Evidence coverage</dt>
+              <dd>
+                {percent(trust.evidence_coverage ?? payload.evidence_coverage)}
+              </dd>
+            </div>
+          </dl>
         </div>
-        <dl>
-          <div>
-            <dt>Score</dt>
-            <dd>
-              {Math.round(Number(trust.score ?? payload.trust_score ?? 0))}
-            </dd>
+        <div className="sc-activation" aria-labelledby="inspect-next-title">
+          <div className="sc-activation-heading">
+            <span className="eyebrow">Inspect next</span>
+            <h2 id="inspect-next-title">
+              Start with the evidence that can change the review.
+            </h2>
           </div>
-          <div>
-            <dt>Grade</dt>
-            <dd>{trust.grade || payload.grade || "-"}</dd>
+          <div className="sc-activation-grid">
+            <a href="#evidence-gaps">
+              <CircleAlert size={19} />
+              <strong>{evidenceGaps.length} evidence gaps</strong>
+              <span>See which unavailable sources affect confidence.</span>
+            </a>
+            <a href="#historical-evidence">
+              <History size={19} />
+              <strong>{fixes + cveCount} historical signals</strong>
+              <span>
+                {fixes} fixes and {cveCount} disclosed CVEs to inspect.
+              </span>
+            </a>
+            <a href="#review-leads">
+              <Search size={19} />
+              <strong>{reviewLeads.length} ranked review leads</strong>
+              <span>
+                Open an evidence-backed starting point for deeper review.
+              </span>
+            </a>
           </div>
-          <div>
-            <dt>Confidence</dt>
-            <dd>{trust.confidence || payload.confidence || "unknown"}</dd>
-          </div>
-          <div>
-            <dt>Evidence coverage</dt>
-            <dd>
-              {percent(trust.evidence_coverage ?? payload.evidence_coverage)}
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section className="sc-activation" aria-labelledby="inspect-next-title">
-        <div className="sc-activation-heading">
-          <span className="eyebrow">Inspect next</span>
-          <h2 id="inspect-next-title">
-            Start with the evidence that can change the review.
-          </h2>
-        </div>
-        <div className="sc-activation-grid">
-          <a href="#evidence-gaps">
-            <CircleAlert size={19} />
-            <strong>{evidenceGaps.length} evidence gaps</strong>
-            <span>See which unavailable sources affect confidence.</span>
-          </a>
-          <a href="#historical-evidence">
-            <History size={19} />
-            <strong>{fixes + cveCount} historical signals</strong>
-            <span>
-              {fixes} fixes and {cveCount} disclosed CVEs to inspect.
-            </span>
-          </a>
-          <a href="#review-leads">
-            <Search size={19} />
-            <strong>{reviewLeads.length} ranked review leads</strong>
-            <span>
-              Open an evidence-backed starting point for deeper review.
-            </span>
-          </a>
         </div>
       </section>
       <section
@@ -459,14 +510,46 @@ export function ContextReport({ repository, payload }) {
           Historical security boundaries with explicit evidence and guard
           status. A watch entry is not a confirmed current vulnerability.
         </p>
-        <div className="sc-table-shell">
-          <table className="sc-watch">
+        <div className="sc-table-tools">
+          <span>Column focus</span>
+          <div role="group" aria-label="Choose a regression watchlist column">
+            {[
+              ["balanced", "All"],
+              ["contract", "Contract"],
+              ["surface", "Surface"],
+              ["evidence", "Evidence"],
+              ["current", "Current ref"],
+            ].map(([value, label], columnIndex) => (
+              <button
+                type="button"
+                aria-pressed={watchColumn === value}
+                onClick={() => focusWatchColumn(value, columnIndex - 1)}
+                key={value}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <small>Tap a column to give dense evidence more room.</small>
+        </div>
+        <div
+          className="sc-table-shell"
+          role="region"
+          aria-label="Regression watchlist table"
+          tabIndex="0"
+          ref={watchShellRef}
+        >
+          <table className="sc-watch" data-focus={watchColumn}>
+            <caption>
+              Regression contracts, protected surfaces, supporting evidence, and
+              current analysis status
+            </caption>
             <thead>
               <tr>
-                <th>Contract</th>
-                <th>Protected surface</th>
-                <th>Evidence and guard</th>
-                <th>Current ref</th>
+                <th scope="col">Contract</th>
+                <th scope="col">Protected surface</th>
+                <th scope="col">Evidence and guard</th>
+                <th scope="col">Current ref</th>
               </tr>
             </thead>
             <tbody>{watchRows(visibleContracts)}</tbody>
@@ -478,8 +561,25 @@ export function ContextReport({ repository, payload }) {
               Show all regression contracts
               <span>({remainingContracts.length} more)</span>
             </summary>
-            <div className="sc-table-shell">
-              <table className="sc-watch sc-watch-continuation">
+            <div
+              className="sc-table-shell"
+              role="region"
+              aria-label="Additional regression watchlist entries"
+              tabIndex="0"
+            >
+              <table
+                className="sc-watch sc-watch-continuation"
+                data-focus={watchColumn}
+              >
+                <caption>Additional regression contracts</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Contract</th>
+                    <th scope="col">Protected surface</th>
+                    <th scope="col">Evidence and guard</th>
+                    <th scope="col">Current ref</th>
+                  </tr>
+                </thead>
                 <tbody>{watchRows(remainingContracts)}</tbody>
               </table>
             </div>
@@ -548,8 +648,23 @@ export function ContextReport({ repository, payload }) {
             </button>
           </div>
         </div>
-        <div className="sc-table-shell">
+        <div
+          className="sc-table-shell"
+          role="region"
+          aria-label="Fixed vulnerabilities table"
+          tabIndex="0"
+        >
           <table className="sc-fixes">
+            <caption>Historical fixed vulnerabilities</caption>
+            <thead>
+              <tr>
+                <th scope="col">Severity</th>
+                <th scope="col">Vulnerability</th>
+                <th scope="col">Component</th>
+                <th scope="col">Fixed</th>
+                <th scope="col">Commit</th>
+              </tr>
+            </thead>
             <tbody>
               {visibleFingerprints.length ? (
                 visibleFingerprints
@@ -571,8 +686,23 @@ export function ContextReport({ repository, payload }) {
               Show all vulnerabilities{" "}
               <span>({visibleFingerprints.length - 12} more)</span>
             </summary>
-            <div className="sc-table-shell">
+            <div
+              className="sc-table-shell"
+              role="region"
+              aria-label="Additional fixed vulnerabilities"
+              tabIndex="0"
+            >
               <table className="sc-fixes">
+                <caption>Additional historical fixed vulnerabilities</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Severity</th>
+                    <th scope="col">Vulnerability</th>
+                    <th scope="col">Component</th>
+                    <th scope="col">Fixed</th>
+                    <th scope="col">Commit</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {visibleFingerprints
                     .slice(12)
@@ -613,6 +743,12 @@ export function ContextReport({ repository, payload }) {
 
 function rowsFrom(value) {
   return Array.isArray(value) ? value.filter(Boolean).map(String) : [];
+}
+
+function motionPreference() {
+  return globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ? "auto"
+    : "smooth";
 }
 
 function percent(value) {
@@ -663,64 +799,72 @@ function watchRows(contracts) {
     return (
       <tr key={contract.id}>
         <td data-label="Contract">
-          <strong>{contract.title}</strong>
-          <SeverityPill value={contract.impact} />
-          <small>
-            {String(contract.evidence_tier || "unknown").toUpperCase()} ·{" "}
-            {contract.lifecycle?.state || "candidate"}
-          </small>
-          {contract.owner?.codeowners?.length > 0 && (
+          <div className="sc-cell-content">
+            <strong>{contract.title}</strong>
+            <SeverityPill value={contract.impact} />
+            <small>
+              {String(contract.evidence_tier || "unknown").toUpperCase()} ·{" "}
+              {contract.lifecycle?.state || "candidate"}
+            </small>
+            {contract.owner?.codeowners?.length > 0 && (
+              <div className="sc-refs">
+                {contract.owner.codeowners.map((owner) => (
+                  <span className="sc-ref" key={owner}>
+                    owner: {owner}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </td>
+        <td data-label="Protected surface">
+          <div className="sc-cell-content">
+            <span className="sc-redbar" />
+            <code title={contract.invariant || ""}>
+              {clip(surface.path || surface.component || "repository", 54)}
+            </code>
+            <small>
+              {clip(contract.invariant || "Review historical evidence", 90)}
+            </small>
+          </div>
+        </td>
+        <td data-label="Evidence and guard">
+          <div className="sc-cell-content">
+            <span className="sc-blackbar" />
+            <strong>{guardLabel(assessment.guard_status)}</strong>
             <div className="sc-refs">
-              {contract.owner.codeowners.map((owner) => (
-                <span className="sc-ref" key={owner}>
-                  owner: {owner}
+              {evidence.slice(0, 3).map((item) => (
+                <span className="sc-ref" key={`${item.relation}:${item.id}`}>
+                  {shortEvidenceRef(item.id)}
+                </span>
+              ))}
+              {guards.slice(0, 2).map((guard) => (
+                <span className="sc-ref" key={guard.id}>
+                  {clip(guard.path, 28)}
                 </span>
               ))}
             </div>
-          )}
-        </td>
-        <td data-label="Protected surface">
-          <span className="sc-redbar" />
-          <code title={contract.invariant || ""}>
-            {clip(surface.path || surface.component || "repository", 54)}
-          </code>
-          <small>
-            {clip(contract.invariant || "Review historical evidence", 90)}
-          </small>
-        </td>
-        <td data-label="Evidence and guard">
-          <span className="sc-blackbar" />
-          <strong>{guardLabel(assessment.guard_status)}</strong>
-          <div className="sc-refs">
-            {evidence.slice(0, 3).map((item) => (
-              <span className="sc-ref" key={`${item.relation}:${item.id}`}>
-                {shortEvidenceRef(item.id)}
-              </span>
-            ))}
-            {guards.slice(0, 2).map((guard) => (
-              <span className="sc-ref" key={guard.id}>
-                {clip(guard.path, 28)}
-              </span>
-            ))}
           </div>
         </td>
         <td data-label="Current ref">
-          <strong>{stateLabel(assessment.state)}</strong>
-          <span className="sc-ref">
-            check: {assessment.check_conclusion || "action_required"}
-          </span>
-          <small>
-            {clip(assessment.explanation || "No assessment supplied", 96)}
-          </small>
-          {assessment.missing_analysis?.length > 0 && (
-            <div className="sc-refs">
-              {assessment.missing_analysis.map((item) => (
-                <span className="sc-ref" key={item}>
-                  missing: {item.replaceAll("_", " ")}
-                </span>
-              ))}
-            </div>
-          )}
+          <div className="sc-cell-content">
+            <strong>{stateLabel(assessment.state)}</strong>
+            <span className="sc-ref">
+              check: {assessment.check_conclusion || "action_required"}
+            </span>
+            <small>
+              {clip(assessment.explanation || "No assessment supplied", 96)}
+            </small>
+            {assessment.missing_analysis?.length > 0 && (
+              <div className="sc-refs">
+                {assessment.missing_analysis.map((item) => (
+                  <span className="sc-ref" key={item}>
+                    missing: {item.replaceAll("_", " ")}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
         </td>
       </tr>
     );

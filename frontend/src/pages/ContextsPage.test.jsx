@@ -60,6 +60,8 @@ describe("ContextsPage", () => {
     expect(screen.queryByText("owner/four")).toBeNull();
     expect(screen.getByText("owner/done")).toBeTruthy();
     expect(screen.getByText("3 queued · 1 running")).toBeTruthy();
+    expect(screen.getByRole("search")).toBeTruthy();
+    expect(screen.getByLabelText("Filter by status")).toBeTruthy();
   });
 
   it("applies status and text filters repeatedly", async () => {
@@ -85,5 +87,8 @@ describe("ContextsPage", () => {
     await user.clear(search);
     await user.type(search, "done");
     expect(await screen.findByText("owner/done")).toBeTruthy();
+
+    await user.click(screen.getByLabelText("Clear search"));
+    expect(search.value).toBe("");
   });
 });

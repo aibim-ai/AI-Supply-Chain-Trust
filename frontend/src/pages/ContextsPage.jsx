@@ -1,3 +1,4 @@
+import { Search, SlidersHorizontal, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ErrorState, PageHeader, PageLoader } from "../components/ui";
@@ -92,31 +93,49 @@ export default function ContextsPage() {
         }
       />
       <section className="panel">
-        <div className="filter-row filter-row-wide">
-          <label>
+        <div className="context-filter-toolbar" role="search">
+          <label className="context-filter-search">
             <span className="sr-only">Filter packages</span>
+            <Search size={18} aria-hidden="true" />
             <input
-              className="input"
+              type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Filter repo, status, grade, verdict"
             />
+            {search && (
+              <button
+                type="button"
+                aria-label="Clear search"
+                onClick={() => setSearch("")}
+              >
+                <X size={15} />
+              </button>
+            )}
           </label>
-          <select
-            className="input"
-            value={status}
-            onChange={(e) => setStatus(e.target.value)}
+          <label className="context-filter-status">
+            <SlidersHorizontal size={16} aria-hidden="true" />
+            <span>Status</span>
+            <select
+              aria-label="Filter by status"
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+            >
+              <option value="">All statuses</option>
+              <option value="queued">Queued</option>
+              <option value="running">Running</option>
+              <option value="failed">Failed</option>
+              <option value="completed">Completed</option>
+            </select>
+          </label>
+          <div
+            className="context-live-state"
+            aria-label={`${query.data.stats.pending || 0} queued, ${query.data.stats.active || 0} running`}
           >
-            <option value="">All statuses</option>
-            <option>queued</option>
-            <option>running</option>
-            <option>failed</option>
-            <option>completed</option>
-          </select>
-          <span>
-            {query.data.stats.pending || 0} queued ·{" "}
-            {query.data.stats.active || 0} running
-          </span>
+            <span>
+              {`${query.data.stats.pending || 0} queued · ${query.data.stats.active || 0} running`}
+            </span>
+          </div>
         </div>
         {query.data.partialError && (
           <p className="form-message" data-state="error">

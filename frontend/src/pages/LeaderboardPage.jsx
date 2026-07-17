@@ -39,13 +39,16 @@ export default function LeaderboardPage() {
         ) : (
           <div className="table-wrap">
             <table className="data-table">
+              <caption className="sr-only">
+                Repositories ranked by trust score
+              </caption>
               <thead>
                 <tr>
-                  <th>Rank</th>
-                  <th>Repository</th>
-                  <th>Grade</th>
-                  <th>Trust</th>
-                  <th>Verdict</th>
+                  <th scope="col">Rank</th>
+                  <th scope="col">Repository</th>
+                  <th scope="col">Grade</th>
+                  <th scope="col">Trust</th>
+                  <th scope="col">Verdict</th>
                 </tr>
               </thead>
               <tbody>

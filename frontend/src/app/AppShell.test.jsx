@@ -6,6 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AppShell } from "./AppShell";
 
+const analytics = vi.hoisted(() => ({ capture: vi.fn() }));
+vi.mock("../lib/posthog", async (importOriginal) => ({
+  ...(await importOriginal()),
+  captureProductEvent: analytics.capture,
+}));
+
 describe("AppShell", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -58,12 +64,20 @@ describe("AppShell", () => {
     renderShell();
 
     await user.click(screen.getByRole("button", { name: "MCP" }));
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "mcp_setup_opened",
+      expect.objectContaining({ navigation_surface: "desktop" }),
+    );
     await user.selectOptions(screen.getByLabelText("MCP client"), "codex");
     const command = `codex mcp add securitycontext ${window.location.origin}/mcp`;
     expect(screen.getByText(command)).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /copy/i }));
     expect(writeText).toHaveBeenCalledWith(command);
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "mcp_config_copied",
+      expect.objectContaining({ mcp_client: "codex" }),
+    );
     expect(await screen.findByText("Copied")).toBeTruthy();
   });
 });

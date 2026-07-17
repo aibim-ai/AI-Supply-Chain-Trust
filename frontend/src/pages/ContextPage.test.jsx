@@ -10,7 +10,20 @@ const api = vi.hoisted(() => ({
   result: vi.fn(),
   rescan: vi.fn(),
 }));
+const analytics = vi.hoisted(() => ({ capture: vi.fn() }));
 vi.mock("../lib/api-client", () => ({ trustApi: api }));
+vi.mock("../lib/posthog", () => ({
+  captureProductEvent: analytics.capture,
+  createScanAttempt: vi.fn(() => ({
+    id: "attempt-rescan",
+    request_origin: "context_rescan",
+  })),
+  durationBucketDays: vi.fn(() => "same_day"),
+  getAnalyticsConsent: vi.fn(() => "denied"),
+  getScanAttempt: vi.fn(() => null),
+  markFastResultSeen: vi.fn(() => null),
+  recordCompletedRepository: vi.fn(() => null),
+}));
 
 function renderPage(path = "/r/owner/repo") {
   return render(
@@ -59,9 +72,40 @@ describe("ContextPage", () => {
     expect(screen.getByText("Historical enrichment continues")).toBeTruthy();
     expect(screen.getByText("Review with missing evidence")).toBeTruthy();
     expect(screen.getByText("72")).toBeTruthy();
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "fast_result_ready",
+      expect.objectContaining({
+        confidence_band: "low",
+        coverage_band: "50_74",
+        observation: "client_rendered",
+      }),
+    );
     await waitFor(() =>
       expect(screen.getByTestId("location").textContent).toBe("/r/owner/repo"),
     );
+  });
+
+  it("tracks a complete context render without exposing the repository", async () => {
+    api.context.mockResolvedValue({
+      status: "ready",
+      evidence_coverage: 0.8,
+      context: { trust: { evidence_coverage: 0.8 } },
+    });
+    api.result.mockResolvedValue({});
+    renderPage();
+
+    expect(await screen.findByText("Security context")).toBeTruthy();
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "complete_context_ready",
+      expect.objectContaining({
+        coverage_band: "75_100",
+        entry_mode: "direct_context",
+      }),
+    );
+    const completeCall = analytics.capture.mock.calls.find(
+      ([name]) => name === "complete_context_ready",
+    );
+    expect(completeCall[1]).not.toHaveProperty("repository");
   });
 
   it("shows a stable failed state without exposing retry controls", async () => {

@@ -9,13 +9,14 @@ import {
   MessageSquare,
   Search,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openFeedback } from "../../components/FeedbackWidget";
 import { captureProductEvent } from "../../lib/posthog";
 
 export function ContextReport({ repository, payload }) {
   const [filter, setFilter] = useState("default");
   const [copied, setCopied] = useState("");
+  const reportRef = useRef(null);
   const context = payload.context || {},
     summary = payload.summary || {};
   const trust = context.trust || payload.trust_decision || {};
@@ -78,11 +79,52 @@ export function ContextReport({ repository, payload }) {
     globalThis.window?.location?.href?.split("?")[0] ||
     `https://ai-supply-chain-trust.aibim.ai/r/${repository}`;
 
-  async function copyAction(kind, value) {
+  useEffect(() => {
+    if (!reportRef.current || !("IntersectionObserver" in globalThis))
+      return undefined;
+    const seen = new Set();
+    const timers = new Map();
+    const observer = new globalThis.IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const sectionName = entry.target.dataset.analyticsSection;
+          if (!sectionName || seen.has(sectionName)) continue;
+          if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+            if (timers.has(sectionName)) continue;
+            const timer = globalThis.setTimeout(() => {
+              seen.add(sectionName);
+              timers.delete(sectionName);
+              captureProductEvent("evidence_section_viewed", {
+                section_name: sectionName,
+                section_has_content: entry.target.dataset.hasContent === "true",
+              });
+              observer.unobserve(entry.target);
+            }, 1000);
+            timers.set(sectionName, timer);
+          } else if (timers.has(sectionName)) {
+            globalThis.clearTimeout(timers.get(sectionName));
+            timers.delete(sectionName);
+          }
+        }
+      },
+      { threshold: [0.5] },
+    );
+    reportRef.current
+      .querySelectorAll("[data-analytics-section]")
+      .forEach((section) => observer.observe(section));
+    return () => {
+      timers.forEach((timer) => globalThis.clearTimeout(timer));
+      observer.disconnect();
+    };
+  }, []);
+
+  async function copyAction(kind, value, properties) {
     try {
-      await globalThis.navigator?.clipboard?.writeText(value);
+      if (!globalThis.navigator?.clipboard?.writeText)
+        throw new Error("Clipboard is unavailable");
+      await globalThis.navigator.clipboard.writeText(value);
       setCopied(kind);
-      captureProductEvent(kind, { repository });
+      captureProductEvent(kind, properties);
       globalThis.setTimeout(() => setCopied(""), 1600);
     } catch {
       setCopied("");
@@ -90,7 +132,7 @@ export function ContextReport({ repository, payload }) {
   }
 
   return (
-    <section className="securitycontext-page">
+    <section className="securitycontext-page" ref={reportRef}>
       <div className="sc-title">
         <div>
           <h1>Security context</h1>
@@ -110,36 +152,41 @@ export function ContextReport({ repository, payload }) {
       <nav className="sc-utility-bar" aria-label="Reuse this context">
         <button
           type="button"
-          onClick={() => copyAction("public_link_copied", publicUrl)}
+          onClick={() =>
+            copyAction("public_context_shared", publicUrl, {
+              share_method: "copy_link",
+              share_surface: "context_utility_bar",
+            })
+          }
         >
           <Copy size={15} />
-          {copied === "public_link_copied" ? "Link copied" : "Copy public link"}
+          {copied === "public_context_shared"
+            ? "Link copied"
+            : "Copy public link"}
         </button>
         <button
           type="button"
           onClick={() =>
             copyAction(
-              "mcp_query_copied",
+              "mcp_config_copied",
               `Use ${globalThis.window?.location?.origin || "https://ai-supply-chain-trust.aibim.ai"}/mcp to inspect ${repository}. Begin with evidence gaps, historical fixes or CVEs, and ranked review leads.`,
+              {
+                mcp_client: "generic_query",
+                navigation_surface: "context_report",
+              },
             )
           }
         >
           <Bot size={15} />
-          {copied === "mcp_query_copied"
+          {copied === "mcp_config_copied"
             ? "MCP query copied"
             : "Copy MCP query"}
         </button>
-        <a
-          className="sc-new-scan"
-          href="/"
-          onClick={() =>
-            captureProductEvent("next_repo_started", { repository })
-          }
-        >
+        <a className="sc-new-scan" href="/">
           Scan another repository
         </a>
         <div className="sc-utility-artifacts">
-          {artifactButtons(payload.artifacts, repository)}
+          {artifactButtons(payload.artifacts)}
         </div>
       </nav>
       <section className="sc-decision">
@@ -192,43 +239,19 @@ export function ContextReport({ repository, payload }) {
           </h2>
         </div>
         <div className="sc-activation-grid">
-          <a
-            href="#evidence-gaps"
-            onClick={() =>
-              captureProductEvent("evidence_gap_opened", {
-                repository,
-                source: "activation_card",
-              })
-            }
-          >
+          <a href="#evidence-gaps">
             <CircleAlert size={19} />
             <strong>{evidenceGaps.length} evidence gaps</strong>
             <span>See which unavailable sources affect confidence.</span>
           </a>
-          <a
-            href="#historical-evidence"
-            onClick={() =>
-              captureProductEvent("historical_evidence_opened", {
-                repository,
-                source: "activation_card",
-              })
-            }
-          >
+          <a href="#historical-evidence">
             <History size={19} />
             <strong>{fixes + cveCount} historical signals</strong>
             <span>
               {fixes} fixes and {cveCount} disclosed CVEs to inspect.
             </span>
           </a>
-          <a
-            href="#review-leads"
-            onClick={() =>
-              captureProductEvent("review_lead_opened", {
-                repository,
-                source: "activation_card",
-              })
-            }
-          >
+          <a href="#review-leads">
             <Search size={19} />
             <strong>{reviewLeads.length} ranked review leads</strong>
             <span>
@@ -237,7 +260,12 @@ export function ContextReport({ repository, payload }) {
           </a>
         </div>
       </section>
-      <section className="sc-section sc-evidence-gaps" id="evidence-gaps">
+      <section
+        className="sc-section sc-evidence-gaps"
+        id="evidence-gaps"
+        data-analytics-section="missing_evidence"
+        data-has-content={evidenceGaps.length > 0}
+      >
         <div className="sc-section-head">
           <h2>
             Evidence gaps <span>({evidenceGaps.length})</span>
@@ -338,10 +366,15 @@ export function ContextReport({ repository, payload }) {
         </div>
         <footer className="sc-footer">
           <span>Last analyzed {formatDate(generated)}</span>
-          <div>{artifactButtons(payload.artifacts, repository)}</div>
+          <div>{artifactButtons(payload.artifacts)}</div>
         </footer>
       </section>
-      <section className="sc-section sc-review-leads" id="review-leads">
+      <section
+        className="sc-section sc-review-leads"
+        id="review-leads"
+        data-analytics-section="review_leads"
+        data-has-content={reviewLeads.length > 0}
+      >
         <div className="sc-section-head">
           <h2>
             Ranked review leads <span>({reviewLeads.length})</span>
@@ -353,12 +386,31 @@ export function ContextReport({ repository, payload }) {
         {reviewLeads.length ? (
           <div className="sc-lead-list">
             {reviewLeads.map((lead, index) => (
-              <article
+              <details
                 key={`${lead.rank || index}:${lead.component || repository}`}
+                onToggle={(event) => {
+                  if (!event.currentTarget.open) return;
+                  captureProductEvent("review_lead_opened", {
+                    lead_type: "ranked_review",
+                    lead_position_bucket: positionBucket(index),
+                    evidence_tier: lead.evidence_tier || "unknown",
+                    severity_band: lead.severity || "unknown",
+                    source_section: "ranked_review_leads",
+                  });
+                }}
               >
-                <span className="sc-lead-rank">#{lead.rank || index + 1}</span>
-                <div>
+                <summary>
+                  <span className="sc-lead-rank">
+                    #{lead.rank || index + 1}
+                  </span>
                   <strong>{lead.component || repository}</strong>
+                  <span>
+                    {lead.vulnerability_class ||
+                      lead.vuln_class ||
+                      "review focus"}
+                  </span>
+                </summary>
+                <div>
                   <p>{lead.why || lead.rationale || lead.evidence}</p>
                   <div className="sc-refs">
                     <span className="sc-ref">
@@ -375,7 +427,7 @@ export function ContextReport({ repository, payload }) {
                     </span>
                   </div>
                 </div>
-              </article>
+              </details>
             ))}
           </div>
         ) : (
@@ -384,7 +436,12 @@ export function ContextReport({ repository, payload }) {
           </div>
         )}
       </section>
-      <section className="sc-section" id="historical-evidence">
+      <section
+        className="sc-section"
+        id="historical-evidence"
+        data-analytics-section="regression_watchlist"
+        data-has-content={contracts.length > 0}
+      >
         <div className="sc-section-head">
           <h2>Regression watchlist</h2>
           <div className="sc-refs" aria-label="Regression contract summary">
@@ -429,7 +486,11 @@ export function ContextReport({ repository, payload }) {
           </details>
         )}
       </section>
-      <section className="sc-section">
+      <section
+        className="sc-section"
+        data-analytics-section="fixed_vulnerabilities"
+        data-has-content={visibleFingerprints.length > 0}
+      >
         <h2>Distribution</h2>
         <div className="sc-dist">
           <article>
@@ -442,7 +503,11 @@ export function ContextReport({ repository, payload }) {
           </article>
         </div>
       </section>
-      <section className="sc-section">
+      <section
+        className="sc-section"
+        data-analytics-section="cves"
+        data-has-content={cves.length > 0}
+      >
         <div className="sc-section-head">
           <h2>
             Fixed vulnerabilities <span>({fixes})</span>
@@ -524,9 +589,7 @@ export function ContextReport({ repository, payload }) {
         </h2>
         <div className="sc-cves">
           {cves.length ? (
-            cves
-              .slice(0, 6)
-              .map((cve, index) => cveCard(cve, index, repository))
+            cves.slice(0, 6).map((cve, index) => cveCard(cve, index))
           ) : (
             <div className="empty-state">
               No disclosed CVEs were returned for this repository.
@@ -539,9 +602,7 @@ export function ContextReport({ repository, payload }) {
               Show all CVEs <span>({cves.length - 6} more)</span>
             </summary>
             <div className="sc-cves">
-              {cves
-                .slice(6)
-                .map((cve, index) => cveCard(cve, index + 6, repository))}
+              {cves.slice(6).map((cve, index) => cveCard(cve, index + 6))}
             </div>
           </details>
         )}
@@ -711,17 +772,7 @@ function fixRow(fp, index, repository) {
       </td>
       <td data-label="Commit">
         {commitUrl ? (
-          <a
-            href={commitUrl}
-            target="_blank"
-            rel="noreferrer"
-            onClick={() =>
-              captureProductEvent("historical_fix_opened", {
-                repository,
-                commit_sha: fp.commit_sha,
-              })
-            }
-          >
+          <a href={commitUrl} target="_blank" rel="noreferrer">
             <code>{shortSha(fp.commit_sha)}</code>
             <ExternalLink size={12} />
           </a>
@@ -733,7 +784,7 @@ function fixRow(fp, index, repository) {
   );
 }
 
-function cveCard(cve, index, repository) {
+function cveCard(cve, index) {
   const sourceUrl = cve.source_url || cve.url || cve.references?.[0]?.url || "";
   const evidenceUrl =
     sourceUrl ||
@@ -744,17 +795,7 @@ function cveCard(cve, index, repository) {
     <article className="sc-cve-row" key={cve.id || index}>
       <div>
         {evidenceUrl ? (
-          <a
-            href={evidenceUrl}
-            target="_blank"
-            rel="noreferrer"
-            onClick={() =>
-              captureProductEvent("cve_opened", {
-                repository,
-                cve_id: cve.id,
-              })
-            }
-          >
+          <a href={evidenceUrl} target="_blank" rel="noreferrer">
             <strong>{cve.id || "CVE"}</strong>
             <ExternalLink size={12} />
           </a>
@@ -787,7 +828,7 @@ function SeverityPill({ value }) {
   return <span className={`sc-pill pill-${tone}`}>{text}</span>;
 }
 
-function artifactButtons(artifacts = {}, repository = "") {
+function artifactButtons(artifacts = {}) {
   return Object.entries(artifacts).map(([name, href]) => (
     <a
       className="sc-icon-button"
@@ -796,9 +837,13 @@ function artifactButtons(artifacts = {}, repository = "") {
       aria-label={name.replaceAll("_", " ")}
       title={name.replaceAll("_", " ")}
       onClick={() =>
-        captureProductEvent("artifact_opened", {
-          repository,
-          artifact: name,
+        captureProductEvent("json_or_markdown_downloaded", {
+          artifact_format: name.toLowerCase().includes("json")
+            ? "json"
+            : "markdown",
+          artifact_variant: artifactVariant(name),
+          source_section: "context_report",
+          complete_context: true,
         })
       }
     >
@@ -814,6 +859,16 @@ function severityRank(value) {
       String(value || "").toLowerCase()
     ] || 0
   );
+}
+function positionBucket(index) {
+  if (index < 3) return "top_3";
+  if (index < 10) return "4_10";
+  return "11_plus";
+}
+function artifactVariant(name) {
+  return String(name).toLowerCase().includes("lead")
+    ? "vulnerability_leads"
+    : "security_context";
 }
 function shortSha(value) {
   return String(value || "").slice(0, 7);

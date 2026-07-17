@@ -9,8 +9,14 @@ import {
   X,
 } from "lucide-react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { AnalyticsConsent } from "../components/AnalyticsConsent";
 import { FeedbackWidget } from "../components/FeedbackWidget";
 import { PageAnalytics } from "../components/PageAnalytics";
+import {
+  captureProductEvent,
+  openAnalyticsChoices,
+  routeTemplateForPath,
+} from "../lib/posthog";
 
 const navigation = [
   ["/", "Home"],
@@ -45,7 +51,7 @@ function ThemeToggle() {
   );
 }
 
-function McpMenu() {
+function McpMenu({ navigationSurface }) {
   const [open, setOpen] = useState(false),
     [client, setClient] = useState("cursor"),
     [copied, setCopied] = useState(false),
@@ -103,6 +109,10 @@ function McpMenu() {
         area.remove();
       }
       setCopied(true);
+      captureProductEvent("mcp_config_copied", {
+        mcp_client: client,
+        navigation_surface: navigationSurface,
+      });
       globalThis.setTimeout(() => setCopied(false), 1400);
     } catch {
       setCopied(false);
@@ -117,7 +127,21 @@ function McpMenu() {
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open ? "true" : "false"}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() =>
+          setOpen((value) => {
+            const next = !value;
+            if (next) {
+              captureProductEvent("mcp_setup_opened", {
+                mcp_client_default: client,
+                navigation_surface: navigationSurface,
+                context_available:
+                  routeTemplateForPath(globalThis.location?.pathname) ===
+                  "/r/:owner/:repository",
+              });
+            }
+            return next;
+          })
+        }
       >
         <span>MCP</span>
         <ChevronDown aria-hidden="true" />
@@ -187,7 +211,7 @@ export function AppShell() {
                 {label}
               </NavLink>
             ))}
-            <McpMenu />
+            <McpMenu navigationSurface="desktop" />
           </nav>
           <div className="header-actions">
             <a
@@ -214,7 +238,7 @@ export function AppShell() {
                 {label}
               </Link>
             ))}
-            <McpMenu />
+            <McpMenu navigationSurface="mobile" />
           </nav>
         )}
       </header>
@@ -226,8 +250,12 @@ export function AppShell() {
       <footer className="app-footer">
         <div className="container footer-row">
           <span>AI Supply Chain Trust by AIBIM</span>
+          <button type="button" onClick={openAnalyticsChoices}>
+            Analytics choices
+          </button>
         </div>
       </footer>
+      <AnalyticsConsent />
       <FeedbackWidget />
     </div>
   );

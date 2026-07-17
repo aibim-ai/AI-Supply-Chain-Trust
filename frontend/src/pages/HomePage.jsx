@@ -15,7 +15,7 @@ import ScanHeroBackground from "../components/ScanHeroBackground";
 import { PublicContextList } from "../features/repositories/RepositoryViews";
 import { useAsync } from "../hooks/use-async";
 import { trustApi } from "../lib/api-client";
-import { captureProductEvent } from "../lib/posthog";
+import { captureProductEvent, createScanAttempt } from "../lib/posthog";
 import {
   buildSearchCandidates,
   productForInput,
@@ -43,7 +43,8 @@ export default function HomePage() {
     [activeIndex, setActiveIndex] = useState(0),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
-  const inputStarted = useRef(false);
+  const searchStarted = useRef(false);
+  const selectionTracked = useRef("");
   const syncHome = home.retry;
   const recentRows = rowsFrom(home.data?.recent);
   const product = productForInput(repo);
@@ -78,6 +79,7 @@ export default function HomePage() {
     if (selectedRepo && normalizeRepository(query) !== selectedRepo)
       setSelectedRepo("");
     if (query.length < 2) {
+      searchStarted.current = false;
       setSuggestions([]);
       setSuggestStatus("idle");
       return;
@@ -87,6 +89,15 @@ export default function HomePage() {
     setSuggestStatus("loading");
     const timer = globalThis.setTimeout(async () => {
       try {
+        if (!searchStarted.current) {
+          searchStarted.current = true;
+          captureProductEvent("repository_search_started", {
+            input_type: inputType(query),
+            provider_guess: productForInput(query).id,
+            query_length_bucket: queryLengthBucket(query.length),
+            search_surface: "homepage_hero",
+          });
+        }
         const payload = await trustApi.suggest(query);
         if (!cancelled) {
           setSuggestions(rowsFrom(payload.candidates));
@@ -111,24 +122,57 @@ export default function HomePage() {
     setSelectedRepo(candidate.repo);
     setDropdownOpen(false);
     setError("");
-    captureProductEvent("repo_candidate_selected", {
-      repository: candidate.repo,
-      has_existing_context: Boolean(candidate.scanned),
+    selectionTracked.current = candidate.repo;
+    captureProductEvent("valid_repository_selected", {
+      selection_method: selectionMethod(candidate.source),
+      provider: candidate.product || "github",
+      existing_context: Boolean(candidate.scanned),
+      candidate_position: Math.max(
+        1,
+        candidates.findIndex((item) => item.repo === candidate.repo) + 1,
+      ),
     });
   }
 
-  async function queueScan(value) {
+  async function queueScan(value, candidate = selectedCandidate) {
     if (!isRepository(value))
       return setError("Search and select a repository first.");
-    captureProductEvent("scan_submitted", {
-      repository: value,
-      has_existing_context: false,
+    if (selectionTracked.current !== value) {
+      selectionTracked.current = value;
+      captureProductEvent("valid_repository_selected", {
+        selection_method: selectionMethod(candidate?.source || "input"),
+        provider: candidate?.product || "github",
+        existing_context: false,
+        candidate_position: candidate
+          ? Math.max(
+              1,
+              candidates.findIndex((item) => item.repo === candidate.repo) + 1,
+            )
+          : 1,
+      });
+    }
+    const attempt = createScanAttempt(value, {
+      request_origin: "hero",
+      existing_context: false,
+      provider: candidate?.product || "github",
     });
+    captureProductEvent("scan_requested", {
+      scan_attempt_id: attempt.id,
+      request_origin: attempt.request_origin,
+      existing_context: false,
+      provider: attempt.provider,
+    });
+    const requestStarted = performance.now();
     setBusy(true);
     setError("");
     try {
       await trustApi.rescan(value);
-      captureProductEvent("scan_queue_accepted", { repository: value });
+      captureProductEvent("scan_queued", {
+        scan_attempt_id: attempt.id,
+        queue_latency_ms: Math.round(performance.now() - requestStarted),
+        request_origin: attempt.request_origin,
+        existing_context: false,
+      });
       navigate(`/r/${value}?scan=queued`);
     } catch (cause) {
       setError(cause.message);
@@ -140,23 +184,36 @@ export default function HomePage() {
   async function scanCandidate(candidate) {
     selectCandidate(candidate);
     if (candidate.scanned) {
-      captureProductEvent("existing_context_opened", {
-        repository: candidate.repo,
-        source: "homepage_search",
-      });
       navigate(`/r/${candidate.repo}`);
       return;
     }
-    await queueScan(candidate.repo);
+    await queueScan(candidate.repo, candidate);
   }
 
   async function submit(event) {
     event.preventDefault();
     if (selectedCandidate?.scanned) {
+      if (selectionTracked.current !== selectedCandidate.repo) {
+        selectionTracked.current = selectedCandidate.repo;
+        captureProductEvent("valid_repository_selected", {
+          selection_method: selectionMethod(selectedCandidate.source),
+          provider: selectedCandidate.product || "github",
+          existing_context: true,
+          candidate_position: Math.max(
+            1,
+            candidates.findIndex(
+              (item) => item.repo === selectedCandidate.repo,
+            ) + 1,
+          ),
+        });
+      }
       navigate(`/r/${selectedCandidate.repo}`);
       return;
     }
-    await queueScan(selectedCandidate?.repo || normalizeRepository(repo));
+    await queueScan(
+      selectedCandidate?.repo || normalizeRepository(repo),
+      selectedCandidate,
+    );
   }
   function keyDown(event) {
     if (!dropdownOpen || !candidates.length) return;
@@ -202,10 +259,6 @@ export default function HomePage() {
                 className="input"
                 value={repo}
                 onChange={(e) => {
-                  if (!inputStarted.current) {
-                    inputStarted.current = true;
-                    captureProductEvent("repo_input_started");
-                  }
                   setRepo(e.target.value);
                   setDropdownOpen(true);
                 }}
@@ -272,9 +325,6 @@ export default function HomePage() {
                   setRepo(example);
                   setSelectedRepo("");
                   setDropdownOpen(true);
-                  captureProductEvent("example_repository_selected", {
-                    repository: example,
-                  });
                 }}
               >
                 {example}
@@ -451,6 +501,25 @@ function starText(candidate) {
   const stars = Number(candidate.stars);
   if (!Number.isFinite(stars)) return "";
   return `${stars.toLocaleString()} stars · not scanned yet`;
+}
+
+function inputType(value) {
+  if (/^https?:\/\//i.test(value) || /github\.com\//i.test(value)) return "url";
+  if (/^[^/\s]+\/[^/\s]+$/.test(value)) return "slug";
+  return "text";
+}
+
+function queryLengthBucket(length) {
+  if (length < 5) return "2_4";
+  if (length < 15) return "5_14";
+  if (length < 40) return "15_39";
+  return "40_plus";
+}
+
+function selectionMethod(source) {
+  if (source === "recent" || source === "scanned") return "recent";
+  if (source === "input") return "direct_input";
+  return "suggestion";
 }
 
 function rowsFrom(payload) {

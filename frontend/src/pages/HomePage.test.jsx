@@ -11,8 +11,20 @@ const api = vi.hoisted(() => ({
   suggest: vi.fn(),
   rescan: vi.fn(),
 }));
+const analytics = vi.hoisted(() => ({
+  capture: vi.fn(),
+  createAttempt: vi.fn(() => ({
+    id: "attempt-1",
+    request_origin: "hero",
+    provider: "github",
+  })),
+}));
 
 vi.mock("../lib/api-client", () => ({ trustApi: api }));
+vi.mock("../lib/posthog", () => ({
+  captureProductEvent: analytics.capture,
+  createScanAttempt: analytics.createAttempt,
+}));
 vi.mock("../components/ScanHeroBackground", () => ({
   default: () => <div data-testid="hero-background" />,
 }));
@@ -109,6 +121,26 @@ describe("HomePage", () => {
     await waitFor(() =>
       expect(api.rescan).toHaveBeenCalledWith("r1z4x/another-repo"),
     );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "valid_repository_selected",
+      expect.objectContaining({
+        selection_method: "suggestion",
+        existing_context: false,
+      }),
+    );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "scan_requested",
+      expect.objectContaining({ scan_attempt_id: "attempt-1" }),
+    );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "scan_queued",
+      expect.objectContaining({ scan_attempt_id: "attempt-1" }),
+    );
+    expect(
+      analytics.capture.mock.calls.some(([, properties]) =>
+        Object.hasOwn(properties || {}, "repository"),
+      ),
+    ).toBe(false);
     expect(await screen.findByText("Scan detail route")).toBeTruthy();
   });
 

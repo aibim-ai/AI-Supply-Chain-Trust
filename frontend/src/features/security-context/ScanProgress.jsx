@@ -44,11 +44,11 @@ export function ScanProgress({ repository, retry }) {
         ["Publishing result", "Results appear here automatically", undefined],
       ]
     : [
-        ["Queued", "Job accepted", "done"],
+        ["Queued", "Job accepted", scanStatus === "queued" ? "active" : "done"],
         [
           "Fetching evidence",
           "GitHub metadata, commit history, advisories, and CVEs",
-          "active",
+          scanStatus === "running" ? "active" : undefined,
         ],
         [
           "Building context",
@@ -68,7 +68,9 @@ export function ScanProgress({ repository, retry }) {
         <p>
           {isFailed
             ? "The scan did not complete. Queue it again after the upstream dependency recovers."
-            : "Fast repository metadata is ready. Historical commits and vulnerability evidence continue in the background."}
+            : scanStatus === "queued"
+              ? "The scan is queued. This public page updates automatically when repository evidence becomes available."
+              : "Repository evidence is being collected. A fast result will appear before historical enrichment completes."}
         </p>
         <div className="scan-progress-list">
           {steps.map(([title, detail, state]) => (
@@ -79,6 +81,11 @@ export function ScanProgress({ repository, retry }) {
             </article>
           ))}
         </div>
+        {!isFailed && (
+          <p className="scan-progress-note">
+            You can leave this page and return to the same public URL later.
+          </p>
+        )}
       </section>
     </section>
   );

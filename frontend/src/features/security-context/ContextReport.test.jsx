@@ -15,6 +15,21 @@ const payload = {
     vulnerability_leads_json: "/r/example/repo.leads.json",
     vulnerability_leads_md: "/r/example/repo.leads.md",
   },
+  missing_evidence: [
+    "OpenSSF Scorecard: Scorecard data was unavailable.",
+    "Code safety scanner data was unavailable.",
+  ],
+  leads: {
+    leads: [
+      {
+        rank: 1,
+        component: "src/parser.rs",
+        why: "Review parser length handling before changing packet decoding.",
+        vulnerability_class: "Input validation",
+        decision_source: "rule_based",
+      },
+    ],
+  },
   context: {
     revision: "abcdef1234567890",
     commits_scanned: 120,
@@ -97,6 +112,7 @@ const payload = {
         severity: "high",
         cvss: 8.1,
         summary: "Input validation issue in parser.",
+        source_url: "https://example.test/CVE-2026-0001",
       },
     ],
   },
@@ -113,6 +129,16 @@ describe("ContextReport", () => {
     expect(html).toContain("Distribution");
     expect(html).toContain("Fixed vulnerabilities");
     expect(html).toContain("Disclosed CVEs");
+    expect(html).toContain("Inspect next");
+    expect(html).toContain("Evidence gaps");
+    expect(html).toContain("Ranked review leads");
+    expect(html).toContain("Review parser length handling");
+    expect(html).toContain("Copy public link");
+    expect(html).toContain("Copy MCP query");
+    expect(html).toContain(
+      "https://github.com/example/repo/commit/abcdef1234567890",
+    );
+    expect(html).toContain("https://example.test/CVE-2026-0001");
     expect(html).toContain("security context json");
     expect(html).toContain("vulnerability leads md");
     expect(html).toContain('aria-pressed="true"');

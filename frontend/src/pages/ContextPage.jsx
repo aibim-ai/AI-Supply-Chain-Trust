@@ -1,14 +1,25 @@
 import { ArrowLeft, RefreshCw, ShieldAlert } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ErrorState } from "../components/ui";
 import { ContextReport } from "../features/security-context/ContextReport";
 import { ScanProgress } from "../features/security-context/ScanProgress";
 import { useAsync } from "../hooks/use-async";
 import { trustApi } from "../lib/api-client";
+import {
+  captureProductEvent,
+  createScanAttempt,
+  durationBucketDays,
+  getAnalyticsConsent,
+  getScanAttempt,
+  markFastResultSeen,
+  recordCompletedRepository,
+} from "../lib/posthog";
 
 export default function ContextPage() {
   const [rescan, setRescan] = useState({ status: "idle", error: "" });
+  const fastTracked = useRef(false);
+  const completeTracked = useRef(false);
   const location = useLocation();
   const navigate = useNavigate();
   const { owner, repository: name } = useParams(),
@@ -17,6 +28,70 @@ export default function ContextPage() {
   const query = useAsync(() => trustApi.context(repository), [repository]);
   const resultQuery = useAsync(() => trustApi.result(repository), [repository]);
   const isEnriching = query.data?.status === "enriching";
+
+  useEffect(() => {
+    fastTracked.current = false;
+    completeTracked.current = false;
+  }, [repository]);
+
+  useEffect(() => {
+    const reportReady =
+      resultQuery.data?.trust_score !== undefined ||
+      Boolean(resultQuery.data?.grade);
+    if (!isEnriching || !reportReady || fastTracked.current) return;
+    fastTracked.current = true;
+    const attempt =
+      markFastResultSeen(repository) || getScanAttempt(repository);
+    captureProductEvent("fast_result_ready", {
+      scan_attempt_id: attempt?.id,
+      time_to_fast_result_ms: attempt
+        ? Math.max(0, Date.now() - attempt.started_at)
+        : undefined,
+      confidence_band:
+        resultQuery.data?.confidence ||
+        resultQuery.data?.trust_decision?.confidence ||
+        "unknown",
+      coverage_band: coverageBand(
+        resultQuery.data?.evidence_coverage ??
+          resultQuery.data?.trust_decision?.evidence_coverage,
+      ),
+      entry_mode: attempt ? "scan_flow" : "direct_context",
+      observation: "client_rendered",
+    });
+  }, [isEnriching, repository, resultQuery.data]);
+
+  useEffect(() => {
+    if (query.data?.status !== "ready" || completeTracked.current) return;
+    completeTracked.current = true;
+    const attempt = getScanAttempt(repository);
+    const trust =
+      query.data?.context?.trust || query.data?.trust_decision || {};
+    captureProductEvent("complete_context_ready", {
+      scan_attempt_id: attempt?.id,
+      time_to_complete_context_ms: attempt
+        ? Math.max(0, Date.now() - attempt.started_at)
+        : undefined,
+      fast_result_seen: Boolean(attempt?.fast_result_seen),
+      coverage_band: coverageBand(
+        trust.evidence_coverage ?? query.data?.evidence_coverage,
+      ),
+      entry_mode: attempt ? "scan_flow" : "direct_context",
+      observation: "client_rendered",
+    });
+
+    if (getAnalyticsConsent() !== "granted") return;
+    const completed = recordCompletedRepository(repository);
+    if (completed?.total === 2 && !completed.secondReported) {
+      captureProductEvent("second_repository_scanned", {
+        days_since_first_scan_bucket: durationBucketDays(
+          Date.now() - completed.firstCompletedAt,
+        ),
+        same_session: Boolean(attempt),
+        repository_ordinal: 2,
+        second_scan_entry_mode: attempt ? "scan_flow" : "direct_context",
+      });
+    }
+  }, [query.data, repository]);
 
   useEffect(() => {
     if (!isEnriching && query.data?.status !== "ready") return;
@@ -60,9 +135,27 @@ export default function ContextPage() {
   }, [isEnriching, query.retry, resultQuery.retry]);
 
   async function queueRescan() {
+    const attempt = createScanAttempt(repository, {
+      request_origin: "context_rescan",
+      existing_context: true,
+      provider: "github",
+    });
+    captureProductEvent("scan_requested", {
+      scan_attempt_id: attempt.id,
+      request_origin: attempt.request_origin,
+      existing_context: true,
+      provider: "github",
+    });
+    const requestStarted = performance.now();
     setRescan({ status: "loading", error: "" });
     try {
       await trustApi.rescan(repository);
+      captureProductEvent("scan_queued", {
+        scan_attempt_id: attempt.id,
+        queue_latency_ms: Math.round(performance.now() - requestStarted),
+        request_origin: attempt.request_origin,
+        existing_context: true,
+      });
       setRescan({ status: "queued", error: "" });
     } catch (error) {
       setRescan({ status: "error", error: error.message });
@@ -219,4 +312,14 @@ function percent(value) {
   return Number.isFinite(number) && number > 0
     ? `${Math.round(number * 100)}%`
     : "pending";
+}
+
+function coverageBand(value) {
+  const number = Number(value);
+  const percentValue = number <= 1 ? number * 100 : number;
+  if (!Number.isFinite(percentValue)) return "unknown";
+  if (percentValue < 25) return "0_24";
+  if (percentValue < 50) return "25_49";
+  if (percentValue < 75) return "50_74";
+  return "75_100";
 }

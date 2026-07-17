@@ -11,8 +11,20 @@ const api = vi.hoisted(() => ({
   suggest: vi.fn(),
   rescan: vi.fn(),
 }));
+const analytics = vi.hoisted(() => ({
+  capture: vi.fn(),
+  createAttempt: vi.fn(() => ({
+    id: "attempt-1",
+    request_origin: "hero",
+    provider: "github",
+  })),
+}));
 
 vi.mock("../lib/api-client", () => ({ trustApi: api }));
+vi.mock("../lib/posthog", () => ({
+  captureProductEvent: analytics.capture,
+  createScanAttempt: analytics.createAttempt,
+}));
 vi.mock("../components/ScanHeroBackground", () => ({
   default: () => <div data-testid="hero-background" />,
 }));
@@ -58,7 +70,7 @@ describe("HomePage", () => {
     expect(screen.getByText("Web · JSON · MCP")).toBeTruthy();
   });
 
-  it("queues the selected search result and navigates to scan progress", async () => {
+  it("opens an existing context without queueing a duplicate scan", async () => {
     const user = userEvent.setup();
     render(
       <MemoryRouter initialEntries={["/"]}>
@@ -73,7 +85,7 @@ describe("HomePage", () => {
     );
 
     const input = screen.getByPlaceholderText(
-      "Search repository or paste product link",
+      "Paste a public GitHub URL or owner/repo",
     );
     await user.type(input, "r1z4x");
     const result = await screen.findByText("r1z4x/OWASPAttackSimulator");
@@ -82,9 +94,53 @@ describe("HomePage", () => {
     expect(screen.getByText("score 35 · 2 fixes · 1 CVEs")).toBeTruthy();
     await user.click(result);
 
-    await waitFor(() =>
-      expect(api.rescan).toHaveBeenCalledWith("r1z4x/OWASPAttackSimulator"),
+    expect(api.rescan).not.toHaveBeenCalled();
+    expect(await screen.findByText("Scan detail route")).toBeTruthy();
+  });
+
+  it("queues a repository that has no existing context", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Routes>
+          <Route path="/" element={<HomePage />} />
+          <Route
+            path="/r/:owner/:repo"
+            element={<div>Scan detail route</div>}
+          />
+        </Routes>
+      </MemoryRouter>,
     );
+
+    const input = screen.getByPlaceholderText(
+      "Paste a public GitHub URL or owner/repo",
+    );
+    await user.type(input, "another");
+    await user.click(await screen.findByText("r1z4x/another-repo"));
+
+    await waitFor(() =>
+      expect(api.rescan).toHaveBeenCalledWith("r1z4x/another-repo"),
+    );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "valid_repository_selected",
+      expect.objectContaining({
+        selection_method: "suggestion",
+        existing_context: false,
+      }),
+    );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "scan_requested",
+      expect.objectContaining({ scan_attempt_id: "attempt-1" }),
+    );
+    expect(analytics.capture).toHaveBeenCalledWith(
+      "scan_queued",
+      expect.objectContaining({ scan_attempt_id: "attempt-1" }),
+    );
+    expect(
+      analytics.capture.mock.calls.some(([, properties]) =>
+        Object.hasOwn(properties || {}, "repository"),
+      ),
+    ).toBe(false);
     expect(await screen.findByText("Scan detail route")).toBeTruthy();
   });
 

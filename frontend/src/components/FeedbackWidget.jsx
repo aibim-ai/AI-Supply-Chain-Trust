@@ -1,6 +1,11 @@
 import { MessageSquare, Send, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { trustApi } from "../lib/api-client";
+import {
+  analyticsSurfaceForPath,
+  captureProductEvent,
+  lengthBucket,
+} from "../lib/posthog";
 
 export const OPEN_FEEDBACK_EVENT = "ai-trust:open-feedback";
 
@@ -53,6 +58,14 @@ export function FeedbackWidget() {
         website: data.get("website"),
         repo: repository || undefined,
         page: globalThis.location.pathname,
+      });
+      captureProductEvent("feedback_submitted", {
+        feedback_category: data.get("category"),
+        feedback_surface: analyticsSurfaceForPath(globalThis.location.pathname),
+        has_repository_context: Boolean(repository),
+        message_length_bucket: lengthBucket(
+          String(data.get("message") || "").length,
+        ),
       });
       setStatus({ state: "sent", message: "Thanks — your feedback was sent." });
       form.reset();

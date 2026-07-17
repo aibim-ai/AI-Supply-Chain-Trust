@@ -16,8 +16,13 @@ import {
 } from "./FeedbackWidget";
 
 const api = vi.hoisted(() => ({ feedback: vi.fn() }));
+const analytics = vi.hoisted(() => ({ capture: vi.fn() }));
 
 vi.mock("../lib/api-client", () => ({ trustApi: api }));
+vi.mock("../lib/posthog", async (importOriginal) => ({
+  ...(await importOriginal()),
+  captureProductEvent: analytics.capture,
+}));
 
 describe("FeedbackWidget", () => {
   beforeEach(() => api.feedback.mockResolvedValue({ status: "accepted" }));
@@ -53,6 +58,12 @@ describe("FeedbackWidget", () => {
       await screen.findByText("Thanks — your feedback was sent."),
     ).toBeTruthy();
     expect(screen.getByLabelText("Message").value).toBe("");
+    expect(analytics.capture).toHaveBeenCalledWith("feedback_submitted", {
+      feedback_category: "bug",
+      feedback_surface: "marketing",
+      has_repository_context: true,
+      message_length_bucket: "10_49",
+    });
   });
 
   it("reports submission errors and supports every close path", async () => {

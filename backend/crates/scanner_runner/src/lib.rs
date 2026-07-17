@@ -180,7 +180,7 @@ impl ScannerRunner {
         };
         let output = run_cmd(
             "gitleaks",
-            &["detect", "--source", path, "--no-git", "-f", "json"],
+            &["detect", "--source", &path, "--no-git", "-f", "json"],
             ScannerTool::Gitleaks.timeout_seconds(),
             &[],
         )
@@ -208,7 +208,7 @@ impl ScannerRunner {
                 None,
             ));
         };
-        let req = find_file(path, &["requirements.txt", "pyproject.toml", "setup.py"]);
+        let req = find_file(&path, &["requirements.txt", "pyproject.toml", "setup.py"]);
         let Some(req) = req else {
             return Ok(("skipped".into(), "No Python manifest found".into(), None));
         };
@@ -243,13 +243,13 @@ impl ScannerRunner {
                 None,
             ));
         };
-        let pkg = find_file(path, &["package.json"]);
+        let pkg = find_file(&path, &["package.json"]);
         let Some(_pkg) = pkg else {
             return Ok(("skipped".into(), "No package.json found".into(), None));
         };
         let output = run_cmd(
             "npm",
-            &["audit", "--json", "--prefix", path],
+            &["audit", "--json", "--prefix", &path],
             ScannerTool::NpmAudit.timeout_seconds(),
             &[],
         )
@@ -281,7 +281,7 @@ impl ScannerRunner {
         };
         let output = run_cmd(
             "semgrep",
-            &["--config=auto", "--json", path],
+            &["--config=auto", "--json", &path],
             ScannerTool::Semgrep.timeout_seconds(),
             &[],
         )
@@ -312,7 +312,7 @@ impl ScannerRunner {
         };
         let output = run_cmd(
             "bandit",
-            &["-r", path, "-f", "json"],
+            &["-r", &path, "-f", "json"],
             ScannerTool::Bandit.timeout_seconds(),
             &[],
         )
@@ -345,7 +345,7 @@ impl ScannerRunner {
                 "vuln,secret,misconfig",
                 "-f",
                 "json",
-                path,
+                &path,
             ],
             ScannerTool::Trivy.timeout_seconds(),
             &[],
@@ -364,10 +364,14 @@ impl ScannerRunner {
         ))
     }
 
-    fn available_source(&self) -> Option<&str> {
+    /// Resolve and canonicalize the source path before handing it to external
+    /// scanners. Missing or unspecified sources are never replaced with the
+    /// service process's working directory.
+    fn available_source(&self) -> Option<String> {
         self.source_path
             .as_deref()
-            .filter(|path| Path::new(path).exists())
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .map(|path| path.to_string_lossy().into_owned())
     }
 }
 

@@ -342,7 +342,6 @@ export default function HomePage() {
           </p>
         </div>
       </section>
-      <HowItWorksPipeline />
       <section className="home-assurance" aria-labelledby="assurance-title">
         <div className="home-assurance-heading">
           <span className="eyebrow">Bounded by evidence</span>
@@ -401,6 +400,7 @@ export default function HomePage() {
           </>
         )}
       </section>
+      <HowItWorksPipeline />
     </section>
   );
 }

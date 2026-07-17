@@ -1,121 +1,268 @@
+import { useEffect, useState } from "react";
 import {
-  Code2,
-  FileDiff,
+  Check,
+  CirclePause,
+  CirclePlay,
+  Database,
+  FileJson,
   GitBranch,
-  GitCommitHorizontal,
-  LockKeyhole,
-  Network,
+  Layers3,
+  Radio,
+  ScanSearch,
   ShieldCheck,
-  Sparkles,
-  Tag,
-  Target,
 } from "lucide-react";
 
-const sources = [
-  { label: "Diffs", icon: FileDiff, x: 11.5, y: 24 },
-  { label: "Source code", icon: Code2, x: 31, y: 8.5 },
-  { label: "Security fixes", icon: ShieldCheck, x: 26, y: 32 },
-  { label: "Commit history", icon: GitCommitHorizontal, x: 50, y: 5 },
-  { label: "CVE / GHSA", icon: LockKeyhole, x: 73, y: 9 },
-  { label: "Branches", icon: GitBranch, x: 77, y: 32 },
-  { label: "Releases", icon: Tag, x: 91, y: 24 },
-];
+const REPLAY_INTERVAL = 2800;
 
-const outputs = [
-  { label: "SECURITY_CONTEXT.md", icon: LockKeyhole, x: 30, y: 80 },
-  { label: "VARIANT_LEADS.md", icon: Target, x: 70, y: 80 },
+const stages = [
   {
-    label: "Agent context",
-    icon: Sparkles,
-    x: 50,
-    y: 94,
-    center: true,
+    name: "Capture",
+    phase: "Queued → running",
+    icon: GitBranch,
+    title: "Lock the repository snapshot",
+    description:
+      "Normalize the public repository, persist the job, and bind the scan to the observed default branch and HEAD.",
+    source: "Public repository",
+    processor: "Snapshot identity",
+    outcome: "Stable scan input",
+    events: [
+      ["Input", "Repository normalized"],
+      ["State", "Durable job accepted"],
+      ["Anchor", "Branch + HEAD observed"],
+    ],
+  },
+  {
+    name: "Evaluate",
+    phase: "Foreground",
+    icon: ScanSearch,
+    title: "Publish the fast evidence state",
+    description:
+      "Run the deterministic first pass quickly. Coverage and missing sources stay explicit while deeper evidence continues.",
+    source: "Metadata + policy",
+    processor: "Deterministic rules",
+    outcome: "Fast result ready",
+    events: [
+      ["Signal", "Repository metadata evaluated"],
+      ["Boundary", "Missing evidence retained"],
+      ["Event", "fast_ready published"],
+    ],
+  },
+  {
+    name: "Enrich",
+    phase: "Parallel workers",
+    icon: Layers3,
+    title: "Correlate history and advisories",
+    description:
+      "Checkpoint commit history, inspect bounded commit details, and correlate GitHub advisories, OSV, and NVD evidence in parallel.",
+    source: "History + advisories",
+    processor: "Evidence graph",
+    outcome: "Ranked review leads",
+    events: [
+      ["History", "Commit pages checkpointed"],
+      ["Intel", "OSV / NVD correlated"],
+      ["Fixes", "Security changes classified"],
+    ],
+  },
+  {
+    name: "Publish",
+    phase: "Evidence gated",
+    icon: ShieldCheck,
+    title: "Release reusable trusted context",
+    description:
+      "Only grounded claims pass the evidence gate. The completed context becomes available to people, APIs, and coding agents.",
+    source: "Verified evidence",
+    processor: "Fact + evidence gate",
+    outcome: "Context ready",
+    events: [
+      ["Guardrail", "Claims tied to sources"],
+      ["Artifacts", "JSON + Markdown generated"],
+      ["Delivery", "Web + REST + MCP ready"],
+    ],
   },
 ];
 
-const paths = [
-  "M138 197 V270 H450 V310",
-  "M372 86 V255 H500 V310",
-  "M312 254 V280 H550 V310",
-  "M600 60 V310",
-  "M876 90 V255 H650 V310",
-  "M924 254 V280 H700 V310",
-  "M1092 197 V270 H750 V310",
-  "M500 428 V520 H360 V552",
-  "M600 428 V652",
-  "M700 428 V520 H840 V552",
-];
-
-function PipelineNode({ node, kind }) {
-  const Icon = node.icon;
-  return (
-    <article
-      className={`pipeline-node pipeline-${kind}`}
-      data-center={node.center ? "true" : undefined}
-      role="listitem"
-      style={{ "--node-x": `${node.x}%`, "--node-y": `${node.y}%` }}
-    >
-      <Icon size={16} aria-hidden="true" />
-      <span>{node.label}</span>
-    </article>
-  );
-}
-
 export default function HowItWorksPipeline() {
+  const [activeStage, setActiveStage] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const [motionAllowed, setMotionAllowed] = useState(true);
+  const stage = stages[activeStage];
+  const StageIcon = stage.icon;
+
+  useEffect(() => {
+    const media = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!media) return undefined;
+    const syncMotionPreference = () => {
+      const allowed = !media.matches;
+      setMotionAllowed(allowed);
+      if (!allowed) setPlaying(false);
+    };
+    syncMotionPreference();
+    media.addEventListener?.("change", syncMotionPreference);
+    return () => media.removeEventListener?.("change", syncMotionPreference);
+  }, []);
+
+  useEffect(() => {
+    if (!playing || !motionAllowed) return undefined;
+    const timer = globalThis.setInterval(
+      () => setActiveStage((current) => (current + 1) % stages.length),
+      REPLAY_INTERVAL,
+    );
+    return () => globalThis.clearInterval(timer);
+  }, [playing, motionAllowed]);
+
+  function chooseStage(index) {
+    setActiveStage(index);
+    setPlaying(false);
+  }
+
   return (
     <section className="how-it-works" aria-labelledby="how-it-works-title">
       <div className="how-it-works-heading">
         <div>
-          <span className="eyebrow">How it works</span>
+          <span className="eyebrow">A scan, replayed</span>
           <h2 id="how-it-works-title">From repository to trusted context.</h2>
         </div>
-        <p>One traceable workflow. Every claim stays tied to evidence.</p>
+        <p>
+          A fast result appears first. Durable enrichment keeps moving until
+          every required evidence source reaches a terminal state.
+        </p>
       </div>
 
-      <div className="pipeline-network" role="list" aria-label="Trust pipeline">
-        <svg
-          className="pipeline-connections"
-          viewBox="0 0 1200 720"
-          preserveAspectRatio="none"
+      <div className="pipeline-replay">
+        <div className="pipeline-replay-toolbar">
+          <span className="pipeline-live-label">
+            <Radio size={14} aria-hidden="true" /> Realtime pipeline replay
+          </span>
+          <span className="pipeline-stage-count">
+            Stage {String(activeStage + 1).padStart(2, "0")} / 04
+          </span>
+          <button
+            type="button"
+            className="pipeline-playback"
+            onClick={() => setPlaying((current) => !current)}
+            aria-label={
+              playing ? "Pause pipeline replay" : "Play pipeline replay"
+            }
+            disabled={!motionAllowed}
+          >
+            {playing ? (
+              <CirclePause size={17} aria-hidden="true" />
+            ) : (
+              <CirclePlay size={17} aria-hidden="true" />
+            )}
+            <span>{playing ? "Pause" : "Play"}</span>
+          </button>
+        </div>
+
+        <div
+          className="pipeline-progress"
+          style={{ "--pipeline-progress": `${((activeStage + 1) / 4) * 100}%` }}
           aria-hidden="true"
         >
-          <g className="pipeline-base-paths">
-            {paths.map((path) => (
-              <path d={path} pathLength="100" key={`base-${path}`} />
-            ))}
-          </g>
-          <g className="pipeline-flow-paths">
-            {paths.map((path, index) => (
-              <path
-                d={path}
-                pathLength="100"
-                style={{ "--path-delay": `${index * -0.42}s` }}
-                key={`flow-${path}`}
-              />
-            ))}
-          </g>
-        </svg>
+          <i />
+        </div>
 
-        {sources.map((source) => (
-          <PipelineNode node={source} kind="source" key={source.label} />
-        ))}
+        <ol className="pipeline-stepper" aria-label="Trust pipeline stages">
+          {stages.map((item, index) => {
+            const Icon = item.icon;
+            const state =
+              index === activeStage
+                ? "active"
+                : index < activeStage
+                  ? "complete"
+                  : "waiting";
+            return (
+              <li className="pipeline-step-item" key={item.name}>
+                <button
+                  type="button"
+                  className="pipeline-step"
+                  data-state={state}
+                  aria-current={index === activeStage ? "step" : undefined}
+                  onClick={() => chooseStage(index)}
+                >
+                  <span className="pipeline-step-index">
+                    {index < activeStage ? (
+                      <Check size={14} aria-hidden="true" />
+                    ) : (
+                      `0${index + 1}`
+                    )}
+                  </span>
+                  <span className="pipeline-step-copy">
+                    <strong>{item.name}</strong>
+                    <small>{item.phase}</small>
+                  </span>
+                  <Icon size={16} aria-hidden="true" />
+                </button>
+              </li>
+            );
+          })}
+        </ol>
 
-        <article className="pipeline-center" role="listitem">
-          <span className="pipeline-center-icon" aria-hidden="true">
-            <Network size={18} />
-          </span>
-          <div>
-            <strong>Consolidated security data</strong>
-            <p>
-              Every source becomes one structured evidence set, tied to what
-              this repository has already fixed.
-            </p>
+        <div className="pipeline-runtime" key={stage.name}>
+          <div className="pipeline-runtime-copy">
+            <span className="pipeline-runtime-kicker">
+              <i aria-hidden="true" /> Now processing
+            </span>
+            <h3>{stage.title}</h3>
+            <p>{stage.description}</p>
           </div>
-        </article>
 
-        {outputs.map((output) => (
-          <PipelineNode node={output} kind="output" key={output.label} />
-        ))}
+          <div className="pipeline-route" aria-hidden="true">
+            <div className="pipeline-route-node pipeline-route-source">
+              <Database size={17} />
+              <span>{stage.source}</span>
+            </div>
+            <div className="pipeline-route-rail">
+              <i />
+              <i />
+              <i />
+            </div>
+            <div className="pipeline-route-core">
+              <span className="pipeline-core-orbit" />
+              <StageIcon size={25} />
+              <strong>{stage.processor}</strong>
+            </div>
+            <div className="pipeline-route-rail" data-direction="out">
+              <i />
+              <i />
+              <i />
+            </div>
+            <div className="pipeline-route-node pipeline-route-output">
+              <FileJson size={17} />
+              <span>{stage.outcome}</span>
+            </div>
+          </div>
+
+          <div
+            className="pipeline-event-log"
+            role="list"
+            aria-label={`${stage.name} activity`}
+          >
+            {stage.events.map(([label, message], index) => (
+              <div
+                role="listitem"
+                style={{ "--event-index": index }}
+                key={label}
+              >
+                <span>{label}</span>
+                <strong>{message}</strong>
+                <i aria-hidden="true" />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div
+          className="pipeline-delivery"
+          aria-label="Published context formats"
+        >
+          <span>Delivered as</span>
+          <strong>Web</strong>
+          <strong>JSON</strong>
+          <strong>Markdown</strong>
+          <strong>REST</strong>
+          <strong>MCP</strong>
+        </div>
       </div>
     </section>
   );

@@ -52,7 +52,8 @@ describe("HomePage", () => {
     vi.clearAllMocks();
   });
 
-  it("explains how repository evidence becomes reusable context", async () => {
+  it("replays how repository evidence becomes reusable context", async () => {
+    const user = userEvent.setup();
     render(
       <MemoryRouter>
         <HomePage />
@@ -64,11 +65,31 @@ describe("HomePage", () => {
         name: "From repository to trusted context.",
       }),
     ).toBeTruthy();
-    expect(screen.getByRole("list", { name: "Trust pipeline" })).toBeTruthy();
-    expect(screen.getByText("Consolidated security data")).toBeTruthy();
-    expect(screen.getByText("CVE / GHSA")).toBeTruthy();
-    expect(screen.getByText("SECURITY_CONTEXT.md")).toBeTruthy();
-    expect(screen.getByText("Agent context")).toBeTruthy();
+    expect(
+      screen.getByRole("list", { name: "Trust pipeline stages" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Lock the repository snapshot")).toBeTruthy();
+    const enrich = screen.getByRole("button", { name: /Enrich/ });
+    expect(enrich).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Publish/ })).toBeTruthy();
+    expect(screen.getByText("MCP")).toBeTruthy();
+
+    await user.click(enrich);
+    expect(screen.getByText("Correlate history and advisories")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Play pipeline replay" }),
+    ).toBeTruthy();
+
+    const publicContexts = screen.getByRole("heading", {
+      name: "Public contexts",
+    });
+    const pipelineHeading = screen.getByRole("heading", {
+      name: "From repository to trusted context.",
+    });
+    const headings = screen.getAllByRole("heading");
+    expect(headings.indexOf(pipelineHeading)).toBeGreaterThan(
+      headings.indexOf(publicContexts),
+    );
   });
 
   it("opens an existing context without queueing a duplicate scan", async () => {

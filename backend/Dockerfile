@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf 
 COPY --from=builder /app/target/release/ai-supply-chain-trust /usr/local/bin/ai-supply-chain-trust
 COPY --from=scorecard-builder /out/scorecard /usr/local/bin/scorecard
 
-RUN mkdir -p /data && chmod 777 /data
+RUN mkdir -p /data && chown nobody:nogroup /data && chmod 700 /data
 
 EXPOSE 8080
 ENV PORT=8080

@@ -72,13 +72,15 @@ describe("ContextPage", () => {
     expect(screen.getByText("Historical enrichment continues")).toBeTruthy();
     expect(screen.getByText("Review with missing evidence")).toBeTruthy();
     expect(screen.getByText("72")).toBeTruthy();
-    expect(analytics.capture).toHaveBeenCalledWith(
-      "fast_result_ready",
-      expect.objectContaining({
-        confidence_band: "low",
-        coverage_band: "50_74",
-        observation: "client_rendered",
-      }),
+    await waitFor(() =>
+      expect(analytics.capture).toHaveBeenCalledWith(
+        "fast_result_ready",
+        expect.objectContaining({
+          confidence_band: "low",
+          coverage_band: "50_74",
+          observation: "client_rendered",
+        }),
+      ),
     );
     await waitFor(() =>
       expect(screen.getByTestId("location").textContent).toBe("/r/owner/repo"),
@@ -95,12 +97,14 @@ describe("ContextPage", () => {
     renderPage();
 
     expect(await screen.findByText("Security context")).toBeTruthy();
-    expect(analytics.capture).toHaveBeenCalledWith(
-      "complete_context_ready",
-      expect.objectContaining({
-        coverage_band: "75_100",
-        entry_mode: "direct_context",
-      }),
+    await waitFor(() =>
+      expect(analytics.capture).toHaveBeenCalledWith(
+        "complete_context_ready",
+        expect.objectContaining({
+          coverage_band: "75_100",
+          entry_mode: "direct_context",
+        }),
+      ),
     );
     const completeCall = analytics.capture.mock.calls.find(
       ([name]) => name === "complete_context_ready",

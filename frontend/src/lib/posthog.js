@@ -96,6 +96,7 @@ const EVENT_PROPERTIES = {
 let posthogPromise;
 let initializedPostHog;
 let googleTagManagerInitialized = false;
+let googleConsentModeInitialized = false;
 
 export function getAnalyticsConsent() {
   try {
@@ -114,8 +115,9 @@ export function setAnalyticsConsent(value) {
     // Consent still applies for this page even if storage is unavailable.
   }
 
+  initializeGoogleConsentMode();
   if (value === "denied") {
-    globalThis.gtag?.("consent", "update", {
+    globalThis.gtag("consent", "update", {
       analytics_storage: "denied",
       ad_storage: "denied",
       ad_user_data: "denied",
@@ -124,10 +126,11 @@ export function setAnalyticsConsent(value) {
     void initializedPostHog?.then((posthog) => {
       posthog?.opt_out_capturing?.();
       posthog?.reset?.(true);
+      clearAnalyticsStorage();
     });
-    clearAnalyticsCookies();
+    clearAnalyticsStorage();
   } else if (IS_PRODUCTION) {
-    globalThis.gtag?.("consent", "update", {
+    globalThis.gtag("consent", "update", {
       analytics_storage: "granted",
       ad_storage: "denied",
       ad_user_data: "denied",
@@ -145,6 +148,21 @@ export function openAnalyticsChoices() {
   globalThis.dispatchEvent?.(
     new globalThis.CustomEvent(OPEN_ANALYTICS_CHOICES_EVENT),
   );
+}
+
+export function initializeGoogleConsentMode() {
+  if (googleConsentModeInitialized || typeof window === "undefined") return;
+  globalThis.dataLayer ||= [];
+  globalThis.gtag ||= function gtag() {
+    globalThis.dataLayer.push(arguments);
+  };
+  globalThis.gtag("consent", "default", {
+    analytics_storage: "denied",
+    ad_storage: "denied",
+    ad_user_data: "denied",
+    ad_personalization: "denied",
+  });
+  googleConsentModeInitialized = true;
 }
 
 function loadPostHog() {
@@ -211,19 +229,54 @@ export function initializePostHog() {
   });
 }
 
-function clearAnalyticsCookies() {
+function analyticsCookieDomains(hostname) {
+  if (!hostname || hostname === "localhost") return [""];
+  const labels = hostname.split(".").filter(Boolean);
+  const domains = ["", hostname, `.${hostname}`];
+  for (let index = 1; index <= labels.length - 2; index += 1) {
+    const parent = labels.slice(index).join(".");
+    domains.push(parent, `.${parent}`);
+  }
+  return [...new Set(domains)];
+}
+
+function clearAnalyticsStorage() {
   if (typeof document === "undefined") return;
   const hostname = globalThis.location?.hostname || "";
   document.cookie.split(";").forEach((cookie) => {
     const name = cookie.split("=")[0].trim();
-    if (!name.startsWith("_ga") && !name.startsWith("ph_")) return;
-    const domains = ["", hostname, hostname ? `.${hostname}` : ""].filter(
-      (value, index, values) => values.indexOf(value) === index,
-    );
-    for (const domain of domains) {
+    if (
+      !["_ga", "_gid", "_gat", "_gcl", "ph_"].some((prefix) =>
+        name.startsWith(prefix),
+      )
+    )
+      return;
+    for (const domain of analyticsCookieDomains(hostname)) {
       document.cookie = `${name}=; Max-Age=0; path=/${domain ? `; domain=${domain}` : ""}`;
     }
   });
+
+  for (const storageName of ["localStorage", "sessionStorage"]) {
+    try {
+      const storage = globalThis[storageName];
+      if (!storage) continue;
+      const removable = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (
+          key &&
+          key !== ANALYTICS_CONSENT_KEY &&
+          (key.startsWith("ph_") ||
+            key.startsWith("__ph_") ||
+            key === "trust.analytics_pageview")
+        )
+          removable.push(key);
+      }
+      removable.forEach((key) => storage.removeItem(key));
+    } catch {
+      // Consent remains denied when browser storage is unavailable.
+    }
+  }
 }
 
 function initializeGoogleTagManager() {
@@ -236,11 +289,8 @@ function initializeGoogleTagManager() {
   )
     return;
 
-  globalThis.dataLayer ||= [];
-  globalThis.gtag ||= function gtag() {
-    globalThis.dataLayer.push(arguments);
-  };
-  globalThis.gtag("consent", "default", {
+  initializeGoogleConsentMode();
+  globalThis.gtag("consent", "update", {
     analytics_storage: "granted",
     ad_storage: "denied",
     ad_user_data: "denied",

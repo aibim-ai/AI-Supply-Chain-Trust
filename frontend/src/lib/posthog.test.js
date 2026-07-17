@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ANALYTICS_CONSENT_EVENT,
+  ANALYTICS_CONSENT_KEY,
   OPEN_ANALYTICS_CHOICES_EVENT,
   analyticsSurfaceForPath,
   capturePageView,
@@ -11,6 +12,7 @@ import {
   durationBucketDays,
   getScanAttempt,
   getAnalyticsConsent,
+  initializeGoogleConsentMode,
   initializeAnalytics,
   lengthBucket,
   markFastResultSeen,
@@ -63,6 +65,29 @@ describe("analytics privacy and local state", () => {
     expect(listener).toHaveBeenCalledOnce();
     expect(listener.mock.calls[0][0].detail.value).toBe("denied");
     globalThis.removeEventListener(ANALYTICS_CONSENT_EVENT, listener);
+  });
+
+  it("defaults vendor consent to denied and clears analytics storage", () => {
+    initializeGoogleConsentMode();
+    const defaultConsent = globalThis.dataLayer.find(
+      (entry) => entry?.[0] === "consent" && entry?.[1] === "default",
+    );
+    expect(defaultConsent?.[2]).toMatchObject({
+      analytics_storage: "denied",
+      ad_storage: "denied",
+      ad_user_data: "denied",
+      ad_personalization: "denied",
+    });
+
+    localStorage.setItem("ph_example", "vendor-state");
+    globalThis.sessionStorage.setItem("trust.analytics_pageview", "1");
+    setAnalyticsConsent("denied");
+
+    expect(localStorage.getItem(ANALYTICS_CONSENT_KEY)).toBe("denied");
+    expect(localStorage.getItem("ph_example")).toBeNull();
+    expect(
+      globalThis.sessionStorage.getItem("trust.analytics_pageview"),
+    ).toBeNull();
   });
 
   it("detects a second distinct repository without storing raw names", () => {

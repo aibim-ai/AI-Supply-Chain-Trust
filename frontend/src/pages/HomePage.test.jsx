@@ -52,7 +52,7 @@ describe("HomePage", () => {
     vi.clearAllMocks();
   });
 
-  it("explains the progressive evidence and bounded LLM pipeline", async () => {
+  it("explains how repository evidence becomes reusable context", async () => {
     render(
       <MemoryRouter>
         <HomePage />
@@ -65,9 +65,10 @@ describe("HomePage", () => {
       }),
     ).toBeTruthy();
     expect(screen.getByRole("list", { name: "Trust pipeline" })).toBeTruthy();
-    expect(screen.getByText("Bounded LLM assist")).toBeTruthy();
-    expect(screen.getByText("Optional")).toBeTruthy();
-    expect(screen.getByText("Web · JSON · MCP")).toBeTruthy();
+    expect(screen.getByText("Consolidated security data")).toBeTruthy();
+    expect(screen.getByText("CVE / GHSA")).toBeTruthy();
+    expect(screen.getByText("SECURITY_CONTEXT.md")).toBeTruthy();
+    expect(screen.getByText("Agent context")).toBeTruthy();
   });
 
   it("opens an existing context without queueing a duplicate scan", async () => {

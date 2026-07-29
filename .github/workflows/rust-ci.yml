@@ -7,14 +7,18 @@ on:
       - "backend/**"
       - "scripts/security_independence_guard.sh"
       - "scripts/test_evidence.sh"
+      - "scripts/test_deploy_contract.sh"
       - "scripts/benchmark_scan_pipeline.sh"
+      - ".github/deploy/production/**"
       - ".github/workflows/rust-ci.yml"
   pull_request:
     paths:
       - "backend/**"
       - "scripts/security_independence_guard.sh"
       - "scripts/test_evidence.sh"
+      - "scripts/test_deploy_contract.sh"
       - "scripts/benchmark_scan_pipeline.sh"
+      - ".github/deploy/production/**"
       - ".github/workflows/rust-ci.yml"
   schedule:
     - cron: "0 6 * * 1"
@@ -39,6 +43,9 @@ jobs:
       - name: Check security data independence
         run: scripts/security_independence_guard.sh
 
+      - name: Check deployment release-gate contract
+        run: scripts/test_deploy_contract.sh
+
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy
@@ -46,6 +53,14 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           workspaces: backend -> target
+
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853
+        with:
+          tool: cargo-audit
+
+      - name: Audit Rust dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: cargo audit
 
       - name: Check formatting
         working-directory: ${{ env.BACKEND_DIR }}

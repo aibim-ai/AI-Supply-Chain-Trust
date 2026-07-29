@@ -26,7 +26,10 @@ Every change must answer four questions:
 | Python guard boundary | Legacy/reference LLM checks | `python3 backend/tests/test_llm_hallucination_guard.py` |
 | Frontend behavior | Data normalization, API retry, report interaction | `npm test -- --run` |
 | Frontend quality | Formatting, lint, production bundling | `npm run format:check`, `npm run lint`, `npm run build` |
+| Browser accessibility | Chromium mobile/failure flows and axe serious/critical gate | `npm run test:e2e` |
+| Frontend SCA | Critical production dependency vulnerability gate | `npm audit --omit=dev --audit-level=critical` |
 | Evidence independence | Forbidden runtime dependency scan | `scripts/security_independence_guard.sh` |
+| Deployment contract | GitHub connectivity and current edge-asset gates fail closed | `scripts/test_deploy_contract.sh` |
 | Local fast path | Cached scan deadline and concurrency tests | `fast_scan_from_cache_meets_local_latency_budget`, `foreground_jobs_can_complete_concurrently` |
 | Production fast path | Real enqueue-to-terminal latency | `scripts/benchmark_scan_pipeline.sh` |
 | Deployment | Container health, routing, GitHub connectivity, real scan | `Deploy Production` workflow log and benchmark CSV |
@@ -38,7 +41,10 @@ scripts/test_evidence.sh
 ```
 
 Output is written under `.cache/test-evidence/` and is intentionally not
-committed. CI artifacts are the durable evidence for a commit.
+committed. The summary records both the base commit and whether the worktree was
+clean; dirty local evidence also includes a status-list hash, so it cannot be
+mistaken for a clean-commit CI artifact. CI artifacts are the durable evidence
+for a commit.
 
 ## Current measured baseline
 

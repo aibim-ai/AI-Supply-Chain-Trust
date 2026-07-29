@@ -18,6 +18,27 @@ pub struct Database {
     pg: Option<PgPool>,
 }
 
+pub struct DiscoveryCandidateRecord<'a> {
+    pub cycle_id: i64,
+    pub repo: &'a str,
+    pub source: &'a str,
+    pub stars: i64,
+    pub description: &'a str,
+    pub disposition: &'a str,
+    pub reason: Option<&'a str>,
+    pub scan_job_id: Option<i64>,
+}
+
+pub struct DiscoveryCycleCompletion<'a> {
+    pub cycle_id: i64,
+    pub discovered_count: usize,
+    pub eligible_count: usize,
+    pub queued_count: usize,
+    pub existing_count: usize,
+    pub failure_count: usize,
+    pub error: Option<&'a str>,
+}
+
 fn report_context_summary(report: &Value) -> (usize, usize, &'static str) {
     let fixes = report
         .get("observed_metrics")
@@ -262,6 +283,20 @@ impl Database {
         } else {
             "sqlite"
         }
+    }
+
+    pub async fn health_check(&self) -> Result<(), anyhow::Error> {
+        {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sqlite lock poisoned"))?;
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+        }
+        if let Some(pool) = &self.pg {
+            sqlx::query("SELECT 1").execute(pool).await?;
+        }
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<(), anyhow::Error> {
@@ -541,6 +576,46 @@ impl Database {
             )?;
         }
 
+        // v10: durable repository discovery provenance and cycle telemetry.
+        if version < 10 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS discovery_cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    discovered_count INTEGER NOT NULL DEFAULT 0,
+                    eligible_count INTEGER NOT NULL DEFAULT 0,
+                    queued_count INTEGER NOT NULL DEFAULT 0,
+                    existing_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS discovery_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_id INTEGER NOT NULL REFERENCES discovery_cycles(id) ON DELETE CASCADE,
+                    repo TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    stars INTEGER NOT NULL DEFAULT 0,
+                    description TEXT NOT NULL DEFAULT '',
+                    disposition TEXT NOT NULL,
+                    reason TEXT,
+                    scan_job_id INTEGER REFERENCES scan_jobs(id),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(cycle_id, repo)
+                );
+                CREATE INDEX IF NOT EXISTS idx_discovery_cycles_recent
+                    ON discovery_cycles(started_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_discovery_candidates_cycle_disposition
+                    ON discovery_candidates(cycle_id, disposition);
+                INSERT OR REPLACE INTO daemon_state (key, value, updated_at)
+                    VALUES ('schema_version', '10', datetime('now'));",
+            )?;
+        }
+
         conn.execute(
             "UPDATE scan_jobs SET status='queued', started_at=NULL WHERE status='running'",
             [],
@@ -739,6 +814,70 @@ impl Database {
         self.enqueue_rescan_with_lane(repo, priority, "foreground")
     }
 
+    /// Atomically deduplicates or admits one foreground rescan while preserving a
+    /// bounded queued backlog across SQLite processes.
+    pub fn enqueue_rescan_with_capacity(
+        &self,
+        repo: &str,
+        priority: i64,
+        max_queued: usize,
+    ) -> Result<Option<i64>, anyhow::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<Option<i64>, anyhow::Error> {
+            let lane = "foreground";
+            let existing = conn
+                .query_row(
+                    "SELECT id, priority FROM scan_jobs
+                     WHERE repo=?1 AND status IN ('queued', 'running') AND lane=?2
+                     ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, priority DESC, id ASC
+                     LIMIT 1",
+                    params![repo, lane],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok();
+            if let Some((id, current_priority)) = existing {
+                if priority > current_priority {
+                    conn.execute(
+                        "UPDATE scan_jobs SET priority=?1 WHERE id=?2",
+                        params![priority, id],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE scan_jobs
+                     SET status='deduped', completed_at=datetime('now'), last_error=?1
+                     WHERE repo=?2 AND status='queued' AND id<>?3 AND lane=?4",
+                    params![format!("deduped by scan job {id}"), repo, id, lane],
+                )?;
+                return Ok(Some(id));
+            }
+
+            let queued: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM scan_jobs WHERE status='queued'",
+                [],
+                |row| row.get(0),
+            )?;
+            if queued >= max_queued as i64 {
+                return Ok(None);
+            }
+            conn.execute(
+                "INSERT INTO scan_jobs (repo, status, priority, lane) VALUES (?1, 'queued', ?2, ?3)",
+                params![repo, priority, lane],
+            )?;
+            Ok(Some(conn.last_insert_rowid()))
+        })();
+        match result {
+            Ok(result) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(result)
+            }
+            Err(error) => {
+                conn.execute_batch("ROLLBACK").ok();
+                Err(error)
+            }
+        }
+    }
+
     pub fn enqueue_rescan_with_lane(
         &self,
         repo: &str,
@@ -777,6 +916,125 @@ impl Database {
             params![repo, priority, lane],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn start_discovery_cycle(
+        &self,
+        source: &str,
+        config: &Value,
+    ) -> Result<i64, anyhow::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO discovery_cycles (source, config_json) VALUES (?1, ?2)",
+            params![source, config.to_string()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn record_discovery_candidate(
+        &self,
+        record: DiscoveryCandidateRecord<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO discovery_candidates
+                (cycle_id, repo, source, stars, description, disposition, reason, scan_job_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(cycle_id, repo) DO UPDATE SET
+                source=excluded.source,
+                stars=excluded.stars,
+                description=excluded.description,
+                disposition=excluded.disposition,
+                reason=excluded.reason,
+                scan_job_id=excluded.scan_job_id,
+                updated_at=datetime('now')",
+            params![
+                record.cycle_id,
+                record.repo,
+                record.source,
+                record.stars,
+                record.description,
+                record.disposition,
+                record.reason,
+                record.scan_job_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_discovery_cycle(
+        &self,
+        completion: DiscoveryCycleCompletion<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let conn = self.conn.lock().unwrap();
+        let status = if completion.error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        conn.execute(
+            "UPDATE discovery_cycles
+             SET status=?1, discovered_count=?2, eligible_count=?3, queued_count=?4,
+                 existing_count=?5, failure_count=?6, error=?7, completed_at=datetime('now')
+             WHERE id=?8",
+            params![
+                status,
+                completion.discovered_count as i64,
+                completion.eligible_count as i64,
+                completion.queued_count as i64,
+                completion.existing_count as i64,
+                completion.failure_count as i64,
+                completion.error,
+                completion.cycle_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Durable daily budget counter for background discovery.  It is derived
+    /// from completed cycles so a worker restart cannot reset the allowance.
+    pub fn discovery_queued_today(&self, source: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(queued_count), 0) FROM discovery_cycles
+             WHERE source=?1 AND date(started_at)=date('now')",
+            params![source],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    pub fn discovery_cycles_recent(&self, limit: i64) -> Vec<Value> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT id, source, status, config_json, discovered_count, eligible_count,
+                    queued_count, existing_count, failure_count, error, started_at, completed_at
+             FROM discovery_cycles ORDER BY id DESC LIMIT ?1",
+        ) else {
+            return vec![];
+        };
+        statement
+            .query_map(params![limit.clamp(1, 100)], |row| {
+                let config: String = row.get(3)?;
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "source": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "config": serde_json::from_str::<Value>(&config).unwrap_or(json!({})),
+                    "discovered_count": row.get::<_, i64>(4)?,
+                    "eligible_count": row.get::<_, i64>(5)?,
+                    "queued_count": row.get::<_, i64>(6)?,
+                    "existing_count": row.get::<_, i64>(7)?,
+                    "failure_count": row.get::<_, i64>(8)?,
+                    "error": row.get::<_, Option<String>>(9)?,
+                    "started_at": row.get::<_, String>(10)?,
+                    "completed_at": row.get::<_, Option<String>>(11)?,
+                }))
+            })
+            .ok()
+            .into_iter()
+            .flat_map(|rows| rows.filter_map(Result::ok))
+            .collect()
     }
 
     pub fn claim_next_scan_job(&self) -> Result<Option<(i64, String)>, anyhow::Error> {
@@ -2392,6 +2650,51 @@ impl Database {
                 row.get(0)
             })
             .unwrap_or(0);
+        let discovery_cycles_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM discovery_cycles", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let discovery_cycles_failed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_cycles WHERE status='failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let discovery_candidates_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM discovery_candidates", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let discovery_queued_today: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(queued_count), 0) FROM discovery_cycles
+                 WHERE date(started_at)=date('now')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let latest_discovery = conn
+            .query_row(
+                "SELECT status, discovered_count, eligible_count, queued_count, existing_count,
+                        failure_count, started_at, completed_at
+                 FROM discovery_cycles ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(json!({
+                        "status": row.get::<_, String>(0)?,
+                        "discovered_count": row.get::<_, i64>(1)?,
+                        "eligible_count": row.get::<_, i64>(2)?,
+                        "queued_count": row.get::<_, i64>(3)?,
+                        "existing_count": row.get::<_, i64>(4)?,
+                        "failure_count": row.get::<_, i64>(5)?,
+                        "started_at": row.get::<_, String>(6)?,
+                        "completed_at": row.get::<_, Option<String>>(7)?,
+                    }))
+                },
+            )
+            .unwrap_or(json!(null));
         let mut assessment_states = BTreeMap::<String, i64>::new();
         let mut dispositions = BTreeMap::<String, i64>::new();
         if let Ok(mut stmt) = conn.prepare("SELECT assessment_json FROM regression_assessments") {
@@ -2426,7 +2729,12 @@ impl Database {
             "regression_contracts_verified": verified_contracts,
             "regression_check_runs_published": published_checks,
             "regression_assessments_by_state": assessment_states,
-            "regression_assessments_by_disposition": dispositions
+            "regression_assessments_by_disposition": dispositions,
+            "discovery_cycles_total": discovery_cycles_total,
+            "discovery_cycles_failed": discovery_cycles_failed,
+            "discovery_candidates_total": discovery_candidates_total,
+            "discovery_queued_today": discovery_queued_today,
+            "discovery_latest": latest_discovery
         })
     }
 
@@ -2762,6 +3070,51 @@ mod tests {
         assert_eq!(metrics["llm_latency_average_ms"], json!(120.0));
         assert_eq!(metrics["llm_latency_samples_total"], json!(1));
         assert_eq!(metrics["llm_errors_by_type"]["rate_limited"], json!(1));
+    }
+
+    #[test]
+    fn discovery_cycles_persist_candidate_provenance_and_metrics() {
+        let db = Database::open_memory().unwrap();
+        let cycle_id = db
+            .start_discovery_cycle(
+                "github_created",
+                &json!({"created_since":"2026-07-23", "min_stars": 5}),
+            )
+            .unwrap();
+        let job_id = db
+            .enqueue_rescan_with_lane("owner/repo", 0, "background")
+            .unwrap();
+        db.record_discovery_candidate(DiscoveryCandidateRecord {
+            cycle_id,
+            repo: "owner/repo",
+            source: "github:topic:llm",
+            stars: 42,
+            description: "A discovered repository",
+            disposition: "queued",
+            reason: None,
+            scan_job_id: Some(job_id),
+        })
+        .unwrap();
+        db.complete_discovery_cycle(DiscoveryCycleCompletion {
+            cycle_id,
+            discovered_count: 4,
+            eligible_count: 1,
+            queued_count: 1,
+            existing_count: 2,
+            failure_count: 0,
+            error: None,
+        })
+        .unwrap();
+
+        let cycle = db.discovery_cycles_recent(1).pop().unwrap();
+        assert_eq!(cycle["status"], json!("completed"));
+        assert_eq!(cycle["config"]["min_stars"], json!(5));
+        assert_eq!(cycle["queued_count"], json!(1));
+        let metrics = db.metrics();
+        assert_eq!(metrics["discovery_cycles_total"], json!(1));
+        assert_eq!(metrics["discovery_candidates_total"], json!(1));
+        assert_eq!(metrics["discovery_queued_today"], json!(1));
+        assert_eq!(metrics["discovery_latest"]["eligible_count"], json!(1));
     }
 
     #[test]
@@ -3378,6 +3731,44 @@ mod tests {
     }
 
     #[test]
+    fn capacity_admission_is_atomic_and_preserves_deduplication() {
+        let db = std::sync::Arc::new(Database::open_memory().unwrap());
+        let existing = db
+            .enqueue_rescan_with_capacity("owner/existing", 7, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.enqueue_rescan_with_capacity("owner/existing", 20, 1)
+                .unwrap(),
+            Some(existing)
+        );
+        assert_eq!(
+            db.enqueue_rescan_with_capacity("owner/new", 7, 1).unwrap(),
+            None
+        );
+
+        let concurrent = std::sync::Arc::new(Database::open_memory().unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let db = concurrent.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.enqueue_rescan_with_capacity(&format!("owner/repo-{index}"), 0, 1)
+                        .unwrap()
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .count();
+        assert_eq!(admitted, 1);
+        assert_eq!(concurrent.queue_stats()["queued"], json!(1));
+    }
+
+    #[test]
     fn foreground_scan_jobs_are_claimed_before_background_research() {
         let db = Database::open_memory().unwrap();
         let background = db
@@ -3678,5 +4069,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn postgres_health_and_report_mirror_are_verified() {
+        let pg_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point to an isolated PostgreSQL database");
+        let unique = format!(
+            "ai-repo-trust-postgres-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sqlite_path = std::env::temp_dir().join(format!("{unique}.db"));
+        let db = Database::open_with_pg(&sqlite_path, &pg_url).await.unwrap();
+        db.health_check().await.unwrap();
+        let report = json!({
+            "repo": "example/postgres-mirror",
+            "evaluated_at": "2026-07-30T00:00:00Z",
+            "trust_score": 81.0,
+            "grade": "B",
+            "verdict": "Review",
+            "action": "Review",
+            "next_review_date": "2026-10-28",
+            "coverage": "7/7",
+            "critical_flags": [],
+            "pillar_scores": {},
+            "scanner_runs": [],
+            "observed_metrics": {},
+            "scoring_version": "v1"
+        });
+        db.insert_report_async(&report).await.unwrap();
+        let row = sqlx::query(
+            "SELECT report_json FROM evaluations WHERE repo=$1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind("example/postgres-mirror")
+        .fetch_one(db.pg.as_ref().unwrap())
+        .await
+        .unwrap();
+        let mirrored: String = row.get("report_json");
+        assert_eq!(
+            serde_json::from_str::<Value>(&mirrored).unwrap()["repo"],
+            json!("example/postgres-mirror")
+        );
+        drop(db);
+        std::fs::remove_file(sqlite_path).ok();
     }
 }

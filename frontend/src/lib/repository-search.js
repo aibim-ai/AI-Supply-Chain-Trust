@@ -5,18 +5,10 @@ export function productForInput(value) {
   if (!input) return { id: "github", label: "GitHub" };
   if (/^[^/\s]+\/[^/\s]+$/.test(input))
     return { id: "github", label: "GitHub" };
-  if (input.startsWith("npm:")) return { id: "package", label: "Package" };
-
   const hostname = hostnameFromInput(input);
   if (isProviderHost(hostname, "github.com"))
     return { id: "github", label: "GitHub" };
-  if (isProviderHost(hostname, "gitlab.com"))
-    return { id: "gitlab", label: "GitLab" };
-  if (isProviderHost(hostname, "bitbucket.org"))
-    return { id: "bitbucket", label: "Bitbucket" };
-  if (isProviderHost(hostname, "npmjs.com"))
-    return { id: "package", label: "Package" };
-  return { id: "web", label: "Web" };
+  return { id: "web", label: "GitHub repositories only" };
 }
 
 function hostnameFromInput(input) {

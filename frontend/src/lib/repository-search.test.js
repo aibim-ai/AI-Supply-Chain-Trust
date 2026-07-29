@@ -6,19 +6,17 @@ import {
 } from "./repository-search";
 
 describe("repository search candidates", () => {
-  it("uses product icons from pasted links", () => {
+  it("recognizes GitHub input and labels unsupported providers", () => {
     expect(productForInput("https://github.com/php/php-src").id).toBe("github");
     expect(productForInput("github.com/php/php-src").id).toBe("github");
     expect(productForInput("https://gitlab.com/gitlab-org/gitlab").id).toBe(
-      "gitlab",
+      "web",
     );
-    expect(productForInput("https://bitbucket.org/team/repo").id).toBe(
-      "bitbucket",
-    );
+    expect(productForInput("https://bitbucket.org/team/repo").id).toBe("web");
     expect(productForInput("https://www.npmjs.com/package/react").id).toBe(
-      "package",
+      "web",
     );
-    expect(productForInput("npm:react").id).toBe("package");
+    expect(productForInput("npm:react").id).toBe("web");
   });
 
   it("does not trust provider names embedded in an unrelated URL", () => {
@@ -36,6 +34,15 @@ describe("repository search candidates", () => {
     expect(searchCandidateFromInput("github.com/php/php-src")?.repo).toBe(
       "php/php-src",
     );
+  });
+
+  it("does not create a scan candidate from unsupported providers", () => {
+    expect(
+      searchCandidateFromInput("https://gitlab.com/gitlab-org/gitlab"),
+    ).toBeNull();
+    expect(
+      searchCandidateFromInput("https://bitbucket.org/team/repo"),
+    ).toBeNull();
   });
 
   it("merges suggestions with prior scan metrics", () => {

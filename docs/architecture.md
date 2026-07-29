@@ -190,9 +190,11 @@ starve HTTP health checks, SSE delivery, or foreground queue claims.
 
 ## Persistent data schema
 
-SQLite is the production source today. PostgreSQL definitions exist for
-multi-instance migration; code paths must not assume identical column names
-without an adapter.
+SQLite durably owns queue/evidence state in the bundled single-host topology.
+When `DATABASE_URL` is configured, PostgreSQL additionally mirrors evaluations,
+events, and regression records; it is health-checked at readiness and covered by
+an opt-in integration test. Queue mutation is not yet PostgreSQL-backed, so
+multi-host queue workers remain unsupported until that migration is complete.
 
 ```mermaid
 erDiagram

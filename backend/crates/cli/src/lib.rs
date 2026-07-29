@@ -20,11 +20,7 @@ pub struct Cli {
     pub db_path: String,
 
     /// Web directory for static assets
-    #[arg(
-        long,
-        env = "AI_SUPPLY_CHAIN_TRUST_WEB_DIR",
-        default_value = "frontend/web"
-    )]
+    #[arg(long, env = "AI_SUPPLY_CHAIN_TRUST_WEB_DIR", default_value = "")]
     pub web_dir: String,
 
     /// Base URL for artifact links
@@ -114,7 +110,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS",
-        default_value = "*"
+        default_value = ""
     )]
     pub allowed_origins: String,
 }
@@ -199,9 +195,9 @@ pub struct DiscoverArgs {
     #[arg(long, default_value = "5")]
     pub min_stars: i64,
 
-    /// Only discover repos pushed in last N days
-    #[arg(long)]
-    pub days: Option<i64>,
+    /// Only discover GitHub repositories created in last N days
+    #[arg(long, default_value = "7")]
+    pub days: i64,
 
     /// Skip existing repos already in DB
     #[arg(long)]
@@ -294,6 +290,18 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "3")]
     pub max_concurrent: usize,
 
+    /// Max new GitHub repositories to queue per discovery cycle
+    #[arg(long, default_value = "10")]
+    pub discover_limit: usize,
+
+    /// Minimum stars for newly created GitHub repositories
+    #[arg(long, default_value = "5")]
+    pub discover_min_stars: i64,
+
+    /// Only discover GitHub repositories created in last N days
+    #[arg(long, default_value = "7")]
+    pub discover_days: i64,
+
     /// Don't run discovery, only process queue
     #[arg(long)]
     pub no_discovery: bool,
@@ -329,10 +337,12 @@ mod tests {
     #[test]
     fn serve_defaults() {
         let cli = Cli::try_parse_from(["ai-supply-chain-trust", "serve"]).unwrap();
+        assert!(cli.web_dir.is_empty());
         match cli.command {
             Command::Serve(args) => {
                 assert_eq!(args.port, 8000);
                 assert_eq!(args.host, "0.0.0.0");
+                assert!(args.allowed_origins.is_empty());
             }
             _ => panic!("expected serve"),
         }
@@ -363,6 +373,7 @@ mod tests {
             Command::Discover(args) => {
                 assert_eq!(args.limit_per_source, 5);
                 assert_eq!(args.min_stars, 20);
+                assert_eq!(args.days, 7);
                 assert!(args.skip_existing);
             }
             _ => panic!("expected discover"),

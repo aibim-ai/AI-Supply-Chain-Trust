@@ -36,7 +36,7 @@ GET /health
 
 ```
 GET /healthz
-→ 200 {"status":"ok","db":"connected","scans_total":42}
+→ 200 {"status":"ok","db":"connected","storage_backend":"sqlite","scans_total":42}
 ```
 
 ### API Index

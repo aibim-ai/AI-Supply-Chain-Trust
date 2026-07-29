@@ -33,7 +33,6 @@ dependencies = [
  "ai-supply-chain-trust-evaluator",
  "ai-supply-chain-trust-intelligence",
  "ai-supply-chain-trust-models",
- "ai-supply-chain-trust-render",
  "ai-supply-chain-trust-scanner-runner",
  "ai-supply-chain-trust-scoring",
  "ai-supply-chain-trust-security-context",
@@ -156,15 +155,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-supply-chain-trust-render"
-version = "0.2.0"
-dependencies = [
- "ai-supply-chain-trust-models",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "ai-supply-chain-trust-scanner-runner"
 version = "0.2.0"
 dependencies = [
@@ -206,7 +196,6 @@ dependencies = [
  "ai-supply-chain-trust-intelligence",
  "ai-supply-chain-trust-llm",
  "ai-supply-chain-trust-models",
- "ai-supply-chain-trust-render",
  "ai-supply-chain-trust-security-context",
  "ai-supply-chain-trust-service",
  "ai-supply-chain-trust-storage",
@@ -223,6 +212,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

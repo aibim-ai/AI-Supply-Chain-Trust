@@ -2,7 +2,7 @@
 
 ## Production topology
 
-Production uses `.github/deploy/production/docker-compose.prod.yml` and four
+Production uses `.github/deploy/production/docker-compose.prod.yml` and five
 long-running containers:
 
 | Service | Role | Public port | Persistent data |
@@ -11,8 +11,9 @@ long-running containers:
 | `frontend` | Static React SPA | none | none |
 | `backend` | REST, SSE, MCP, artifacts | none | `/data/trust.db` |
 | `worker` | Foreground queue, evidence DAG, Slack alerts | none | `/data/trust.db` |
+| `nvd-worker` | Dedicated NVD evidence worker | none | `/data/trust.db` |
 
-The backend and worker share the legacy persistent host path
+The backend, worker, and NVD worker share the legacy persistent host path
 `/opt/ai-repo-trust/data:/data`. The path is intentionally retained during the
 product rename so existing production reports are not replaced. `sync_release`
 excludes `data`, `.env.prod`, caches, and build targets. `prepare_data_dir`
@@ -73,16 +74,39 @@ sequenceDiagram
 The deployment workflow is successful only when all of these pass:
 
 1. Backend and frontend images build.
-2. Backend `/health` and `/api/v1/health` respond from inside the container.
+2. Backend `/health` and `/api/v1/healthz` respond from inside the container.
 3. Frontend health and expected CSS reference respond.
 4. Edge route responds after Nginx recreation.
 5. Worker can reach GitHub anonymously and with configured credentials using the
    same Rust/Reqwest stack as the application.
 6. A real queued repository scan satisfies acceptance, queue wait, foreground,
    total latency, and terminal-success gates.
+7. The deployed public home passes Chromium mobile navigation plus axe with no
+   serious or critical violations.
 
 The benchmark result is stored at
 `/opt/ai-repo-trust/data/deploy-scan-performance.csv`.
+
+## Production execution plan
+
+Production release is complete only after every phase has its recorded
+evidence. The release manager owns go/no-go and rollback. The platform operator
+owns host and secret access. The application owner validates user-visible
+behavior and alert delivery.
+
+| Phase | Owner | Action | Acceptance evidence | Stop condition |
+| --- | --- | --- | --- | --- |
+| 0. Preflight | release manager | Review dirty-worktree hash, `scripts/test_evidence.sh`, Compose config, and dependency exception record | Passing summary plus reviewed change scope | Missing evidence or unreviewed source change |
+| 1. Protect state | platform operator | Confirm `/opt/ai-repo-trust/data` persists; make a WAL-safe SQLite backup before any schema-affecting release | Backup location, timestamp, restore owner | Backup cannot be verified |
+| 2. Deploy | platform operator | Run production workflow from reviewed revision | Build, container readiness, GitHub authenticated netchecks, scan benchmark | Any workflow gate fails |
+| 3. Public verification | application owner | Run `npm run test:public-release` against deployed origin, then manual keyboard/screen-reader smoke pass | Passing axe/mobile result and manual checklist | Serious/critical axe finding or failed task flow |
+| 4. Resilience drill | platform operator | Perform queue-restart, dependency-outage, alert-delivery, and rollback drills one at a time | Queue resumes without duplicate terminal work; failure is visible; alert reaches owner; rollback preserves DB | Data loss, duplicate terminal work, unavailable rollback, or missing alert |
+| 5. Closeout | release manager | Attach gate output, backup reference, drill output, public test result, and rollback decision to release record | All prior phases accepted | Any required artifact absent |
+
+Never combine a dependency-outage drill with a rollback drill. First restore the
+dependency, wait for queue recovery evidence, then begin the next controlled
+exercise. Keep production credentials in the runner/secret store; do not place
+them in the worktree or release record.
 
 ## Core configuration
 
@@ -106,6 +130,22 @@ The benchmark result is stored at
 | `AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL` | secret | Slack incoming webhook for product feedback (falls back to alert webhook) |
 | `AI_SUPPLY_CHAIN_TRUST_FAILURE_RECOVERY_INTERVAL_SECONDS` | config | Automatic recovery interval for transient failed work (default `600`) |
 | `AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN` | secret | Admin/worker endpoint authorization |
+| `AI_SUPPLY_CHAIN_TRUST_TRUSTED_PROXY_IPS` | empty | Comma-separated proxy IP allowlist; only these peers may supply client-IP headers |
+
+`/healthz` is the readiness endpoint: it verifies the active SQLite/PostgreSQL connection. If daemon discovery is enabled, it also requires a configured GitHub token unless `AI_SUPPLY_CHAIN_TRUST_DAEMON_DISABLE_DISCOVERY=1` is set. `/health` remains a lightweight liveness endpoint.
+
+The discovery worker itself refuses to start without a non-empty GitHub token; it never falls back to anonymous GitHub search in production.
+
+`AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_TOPICS` optionally replaces the default GitHub topic set. It accepts at most 20 comma-separated topic slugs containing only lowercase letters, digits, and hyphens; invalid input falls back to the reviewed defaults.
+
+Before enabling `DATABASE_URL` in production, run the opt-in PostgreSQL proof against an isolated database:
+
+```bash
+cd backend
+TEST_DATABASE_URL=postgres://... \
+  cargo test -p ai-supply-chain-trust-storage \
+  postgres_health_and_report_mirror_are_verified -- --ignored
+```
 
 Worker progress crosses the container boundary through the persistent
 `trust_events` table. The backend tails this table for SSE clients and honors
@@ -160,3 +200,7 @@ Rollback code/images without replacing `/opt/ai-repo-trust/data`. Before a
 schema-changing release, take an SQLite backup using its online backup mechanism
 or a transactionally safe snapshot. A plain copy of an active WAL database is not
 a valid backup unless the `-wal` state is included or checkpointed.
+
+The deploy helper preserves this bind-mounted state. If it must recover a missing
+host database from a running backend container, it copies `/data/trust.db`, never
+`/tmp/trust.db`.

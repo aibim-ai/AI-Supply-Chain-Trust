@@ -1,19 +1,19 @@
 #![recursion_limit = "256"]
 //! HTTP server — axum. Graceful shutdown, DB health, SSE, MCP, rate limiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_supply_chain_trust_auth::verify_bearer_token;
 use ai_supply_chain_trust_intelligence::IntelligenceClientConfig;
 use ai_supply_chain_trust_service::{Service, ServiceConfig};
-use ai_supply_chain_trust_storage::Database;
+use ai_supply_chain_trust_storage::{Database, DiscoveryCandidateRecord, DiscoveryCycleCompletion};
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json, Response,
@@ -26,16 +26,76 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
+use url::Url;
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<Service>,
     pub base_url: String,
     worker_token: Option<String>,
+    discovery_token_configured: bool,
     pub(crate) rate_limiter: Arc<Mutex<RateLimiter>>,
+    max_queued_scans: usize,
     feedback_limiter: Arc<Mutex<RateLimiter>>,
     scan_permits: Arc<Semaphore>,
     sse_permits: Arc<Semaphore>,
+}
+
+fn max_queued_scans() -> usize {
+    std::env::var("AI_SUPPLY_CHAIN_TRUST_MAX_QUEUED_SCANS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+}
+
+fn parse_allowed_origins(value: &str) -> anyhow::Result<Vec<HeaderValue>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            if origin == "*" {
+                anyhow::bail!("wildcard allowed origins are not permitted");
+            }
+            let parsed = Url::parse(origin)
+                .map_err(|error| anyhow::anyhow!("invalid allowed origin {origin:?}: {error}"))?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                anyhow::bail!(
+                    "allowed origin must be an http(s) origin without credentials or path"
+                );
+            }
+            let canonical = parsed.origin().ascii_serialization();
+            if canonical == "null" || origin.trim_end_matches('/') != canonical {
+                anyhow::bail!("allowed origin must be a canonical http(s) origin");
+            }
+            HeaderValue::from_str(&canonical)
+                .map_err(|error| anyhow::anyhow!("invalid allowed origin {origin:?}: {error}"))
+        })
+        .collect()
+}
+
+fn cors_layer() -> anyhow::Result<CorsLayer> {
+    let origins = std::env::var("AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS")
+        .ok()
+        .map(|value| parse_allowed_origins(&value))
+        .transpose()?
+        .unwrap_or_default();
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    if origins.is_empty() {
+        Ok(layer)
+    } else {
+        Ok(layer.allow_origin(origins))
+    }
 }
 
 #[derive(Debug)]
@@ -135,6 +195,56 @@ impl RateLimiter {
         let normalized = normalize_repo_key(repo);
         self.check(&normalized)
     }
+
+    fn check_requester(&mut self, requester: &str) -> bool {
+        self.check(&format!("requester:{requester}"))
+    }
+}
+
+fn trusted_proxy_ips() -> HashSet<IpAddr> {
+    std::env::var("AI_SUPPLY_CHAIN_TRUST_TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect()
+}
+
+fn requester_key(peer: Option<SocketAddr>, headers: &HeaderMap) -> String {
+    requester_key_with_trusted_proxies(peer, headers, &trusted_proxy_ips())
+}
+
+fn requester_key_with_trusted_proxies(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &HashSet<IpAddr>,
+) -> String {
+    let Some(peer) = peer else {
+        return "unknown".into();
+    };
+    let peer_ip = peer.ip();
+    if trusted_proxies.contains(&peer_ip) {
+        let forwarded_ip = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .find_map(|value| value.parse::<IpAddr>().ok())
+            .or_else(|| {
+                headers
+                    .get("x-real-ip")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<IpAddr>().ok())
+            });
+        if let Some(forwarded_ip) = forwarded_ip {
+            return format!("ip:{forwarded_ip}");
+        }
+    }
+    format!("ip:{peer_ip}")
+}
+
+fn admit_request(limiter: &mut RateLimiter, repo: &str, requester: &str) -> bool {
+    limiter.check_requester(requester) && limiter.check_repo(repo)
 }
 
 fn normalize_repo_key(repo: &str) -> String {
@@ -196,7 +306,9 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
         (
             "allowed_origins",
             "AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS",
-            std::env::var("AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS").is_ok(),
+            std::env::var("AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty()),
         ),
         (
             "JWT secret",
@@ -268,7 +380,9 @@ pub async fn serve(
         worker_token: std::env::var("AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN")
             .ok()
             .filter(|value| !value.is_empty()),
+        discovery_token_configured: discovery_token.is_some(),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 86400))),
+        max_queued_scans: max_queued_scans(),
         feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
         scan_permits: Arc::new(Semaphore::new(4)),
         sse_permits: Arc::new(Semaphore::new(100)),
@@ -320,6 +434,7 @@ pub async fn serve(
         .route("/api/v1/metrics/prometheus", get(prometheus_metrics))
         .route("/api/v1/events", get(events_sse))
         .route("/api/v1/jobs", get(jobs_handler))
+        .route("/api/v1/discovery/cycles", get(discovery_cycles_handler))
         .route("/api/v1/queue/stats", get(queue_stats_handler))
         .route("/api/v1/ops/failures", get(failure_alerts_handler))
         .route(
@@ -348,16 +463,19 @@ pub async fn serve(
         .route("/r/*path", get(security_context_artifact))
         .route("/mcp", get(mcp_info).post(mcp_handler))
         .fallback_service(get(serve_static))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer()?)
         .with_state(state);
 
     let addr = SocketAddr::from((host.parse::<std::net::Ipv4Addr>()?, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "Server listening");
     maybe_start_queue_worker(worker_service, discovery_token);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("Server shut down gracefully");
     Ok(())
@@ -780,14 +898,36 @@ fn start_discovery_worker(
     github_token: Option<String>,
     worker_start_delay_secs: u64,
 ) {
+    if env_flag("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISABLE_DISCOVERY") {
+        warn!("Repository discovery worker disabled by configuration");
+        return;
+    }
+    let Some(github_token) = configured_discovery_token(github_token) else {
+        warn!("Repository discovery worker disabled because no GitHub token is configured");
+        return;
+    };
     let interval_secs = env_u64("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_INTERVAL", 86_400);
-    let limit = env_usize("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_LIMIT", 10).clamp(1, 100);
-    let min_stars =
-        env_u64_allow_zero("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_MIN_STARS", 500) as i64;
-    let pushed_days = env_u64("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_DAYS", 7).clamp(1, 365);
+    let config = DiscoveryWorkerConfig {
+        limit: env_usize("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_LIMIT", 10).clamp(1, 100),
+        min_stars: env_u64_allow_zero("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_MIN_STARS", 5) as i64,
+        created_days: env_u64("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVER_DAYS", 7).clamp(1, 365),
+        daily_budget: env_usize("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_DAILY_BUDGET", 50)
+            .clamp(1, 10_000),
+        queue_capacity: max_queued_scans(),
+        topics: configured_discovery_topics(
+            std::env::var("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISCOVERY_TOPICS")
+                .ok()
+                .as_deref(),
+        ),
+    };
     info!(
         interval_secs,
-        limit, min_stars, "Repository discovery worker starting"
+        limit = config.limit,
+        min_stars = config.min_stars,
+        daily_budget = config.daily_budget,
+        queue_capacity = config.queue_capacity,
+        topics = ?config.topics,
+        "Repository discovery worker starting"
     );
     tokio::spawn(async move {
         if worker_start_delay_secs > 0 {
@@ -795,65 +935,288 @@ fn start_discovery_worker(
         }
         let timeout_secs = env_u64("AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS", 20);
         let mut client = ai_supply_chain_trust_discovery::DiscoveryClient::with_timeout(
-            github_token,
+            Some(github_token),
             timeout_secs,
         );
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tick.tick().await;
-            // The scan pipeline accepts canonical GitHub owner/repo identifiers.
-            // Registry/model discovery remains available to the CLI, but those
-            // identifiers must not be fed into this queue.
-            let pushed_since = (chrono::Utc::now() - chrono::Duration::days(pushed_days as i64))
-                .format("%Y-%m-%d")
-                .to_string();
-            let cycle_started = std::time::Instant::now();
-            let discovered = client
-                .discover_github_recent(limit as i64, min_stars, &pushed_since)
-                .await;
-            let discovered_count = discovered.len();
-            let candidates = discovery_candidates(discovered, min_stars);
-            let candidate_count = candidates.len();
-            let mut queued = 0usize;
-            let mut existing = 0usize;
-            let mut failures = 0usize;
-            for candidate in candidates {
-                if service.get_result(&candidate.repo).is_some() {
-                    existing += 1;
-                    continue;
-                }
-                match service.enqueue_discovery(&candidate.repo, 0) {
-                    Ok(_) => queued += 1,
-                    Err(error) => {
-                        failures += 1;
-                        warn!(repo = %candidate.repo, %error, "Discovered repository could not be queued")
-                    }
-                }
-            }
-            info!(
-                discovered = discovered_count,
-                candidates = candidate_count,
-                existing,
-                queued,
-                failures,
-                elapsed_ms = cycle_started.elapsed().as_millis() as u64,
-                "Repository discovery cycle completed"
-            );
+            run_discovery_cycle(&service, &mut client, &config).await;
         }
     });
 }
 
+#[derive(Clone, Debug)]
+struct DiscoveryWorkerConfig {
+    limit: usize,
+    min_stars: i64,
+    created_days: u64,
+    daily_budget: usize,
+    queue_capacity: usize,
+    topics: Vec<String>,
+}
+
+async fn run_discovery_cycle(
+    service: &Arc<Service>,
+    client: &mut ai_supply_chain_trust_discovery::DiscoveryClient,
+    config: &DiscoveryWorkerConfig,
+) {
+    // The scan pipeline accepts canonical GitHub owner/repo identifiers.
+    // Registry/model discovery remains available to the CLI, but those
+    // identifiers must not be fed into this queue.
+    let created_since = (chrono::Utc::now() - chrono::Duration::days(config.created_days as i64))
+        .format("%Y-%m-%d")
+        .to_string();
+    let cycle_started = std::time::Instant::now();
+    let cycle_id = service
+        .db
+        .start_discovery_cycle(
+            "github_created",
+            &json!({
+                "limit": config.limit,
+                "min_stars": config.min_stars,
+                "created_since": created_since,
+                "token_configured": client.has_github_token(),
+                "daily_queue_budget": config.daily_budget,
+                "queue_capacity": config.queue_capacity,
+                "topics": config.topics,
+            }),
+        )
+        .ok();
+    let discovered = client
+        .discover_github_recent_with_topics(
+            config.limit as i64,
+            config.min_stars,
+            &created_since,
+            &config.topics,
+        )
+        .await;
+    let discovered_count = discovered.len();
+    let candidates = discovery_candidate_decisions(discovered, config.min_stars);
+    let candidate_count = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .count();
+    let already_queued_today = service.db.discovery_queued_today("github_created").max(0) as usize;
+    let remaining_daily_budget = config.daily_budget.saturating_sub(already_queued_today);
+    let mut queued = 0usize;
+    let mut existing = 0usize;
+    let mut failures = 0usize;
+    let mut admitted_this_cycle = 0usize;
+    for candidate in candidates {
+        if !candidate.eligible {
+            record_discovery_candidate(
+                service,
+                cycle_id,
+                &candidate.candidate,
+                "rejected",
+                candidate.reason.as_deref(),
+                None,
+            );
+            continue;
+        }
+        if admitted_this_cycle >= config.limit {
+            record_discovery_candidate(
+                service,
+                cycle_id,
+                &candidate.candidate,
+                "skipped",
+                Some("cycle_candidate_limit_exhausted"),
+                None,
+            );
+            continue;
+        }
+        admitted_this_cycle += 1;
+        if queued >= remaining_daily_budget {
+            record_discovery_candidate(
+                service,
+                cycle_id,
+                &candidate.candidate,
+                "skipped",
+                Some("daily_queue_budget_exhausted"),
+                None,
+            );
+            continue;
+        }
+        if service.get_result(&candidate.candidate.repo).is_some() {
+            existing += 1;
+            record_discovery_candidate(
+                service,
+                cycle_id,
+                &candidate.candidate,
+                "already_scanned",
+                Some("a persisted report already exists"),
+                None,
+            );
+            continue;
+        }
+        match service.enqueue_discovery_with_capacity(
+            &candidate.candidate.repo,
+            0,
+            config.queue_capacity,
+        ) {
+            Ok(Some(job_id)) => {
+                queued += 1;
+                record_discovery_candidate(
+                    service,
+                    cycle_id,
+                    &candidate.candidate,
+                    "queued",
+                    None,
+                    Some(job_id),
+                );
+            }
+            Ok(None) => {
+                record_discovery_candidate(
+                    service,
+                    cycle_id,
+                    &candidate.candidate,
+                    "skipped",
+                    Some("queue_capacity_exhausted"),
+                    None,
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                record_discovery_candidate(
+                    service,
+                    cycle_id,
+                    &candidate.candidate,
+                    "queue_failed",
+                    Some(&error),
+                    None,
+                );
+                warn!(repo = %candidate.candidate.repo, %error, "Discovered repository could not be queued")
+            }
+        }
+    }
+    if let Some(cycle_id) = cycle_id {
+        service
+            .db
+            .complete_discovery_cycle(DiscoveryCycleCompletion {
+                cycle_id,
+                discovered_count,
+                eligible_count: candidate_count,
+                queued_count: queued,
+                existing_count: existing,
+                failure_count: failures,
+                error: None,
+            })
+            .ok();
+    }
+    info!(
+        discovered = discovered_count,
+        candidates = candidate_count,
+        daily_budget = config.daily_budget,
+        already_queued_today,
+        existing,
+        queued,
+        failures,
+        elapsed_ms = cycle_started.elapsed().as_millis() as u64,
+        "Repository discovery cycle completed"
+    );
+}
+
+fn configured_discovery_token(token: Option<String>) -> Option<String> {
+    token.filter(|value| !value.trim().is_empty())
+}
+
+fn configured_discovery_topics(value: Option<&str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let topics = value
+        .into_iter()
+        .flat_map(|topics| topics.split(','))
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|topic| {
+            !topic.is_empty()
+                && topic.len() <= 50
+                && !topic.starts_with('-')
+                && !topic.ends_with('-')
+                && topic
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        .filter(|topic| seen.insert(topic.clone()))
+        .take(20)
+        .collect::<Vec<_>>();
+    if topics.is_empty() {
+        ai_supply_chain_trust_discovery::default_github_topics()
+    } else {
+        topics
+    }
+}
+
+struct DiscoveryCandidateDecision {
+    candidate: ai_supply_chain_trust_discovery::DiscoveredRepo,
+    eligible: bool,
+    reason: Option<String>,
+}
+
+fn record_discovery_candidate(
+    service: &Service,
+    cycle_id: Option<i64>,
+    candidate: &ai_supply_chain_trust_discovery::DiscoveredRepo,
+    disposition: &str,
+    reason: Option<&str>,
+    scan_job_id: Option<i64>,
+) {
+    if let Some(cycle_id) = cycle_id {
+        service
+            .db
+            .record_discovery_candidate(DiscoveryCandidateRecord {
+                cycle_id,
+                repo: &candidate.repo,
+                source: &candidate.source,
+                stars: candidate.stars,
+                description: &candidate.description,
+                disposition,
+                reason,
+                scan_job_id,
+            })
+            .ok();
+    }
+}
+
+#[cfg(test)]
 fn discovery_candidates(
     discovered: Vec<ai_supply_chain_trust_discovery::DiscoveredRepo>,
     min_stars: i64,
 ) -> Vec<ai_supply_chain_trust_discovery::DiscoveredRepo> {
+    discovery_candidate_decisions(discovered, min_stars)
+        .into_iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| candidate.candidate)
+        .collect()
+}
+
+fn discovery_candidate_decisions(
+    discovered: Vec<ai_supply_chain_trust_discovery::DiscoveredRepo>,
+    min_stars: i64,
+) -> Vec<DiscoveryCandidateDecision> {
+    let mut seen = HashSet::new();
     discovered
         .into_iter()
-        .filter(|candidate| candidate.source.starts_with("github:"))
-        .filter(|candidate| candidate.stars >= min_stars)
-        .filter(|candidate| {
+        .map(|candidate| {
+            let reason = if !candidate.source.starts_with("github:") {
+                Some("source_is_not_github".to_string())
+            } else if candidate.stars < min_stars {
+                Some("below_minimum_stars".to_string())
+            } else {
             let mut parts = candidate.repo.split('/');
-            matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty())
+                if !matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty()) {
+                    Some("invalid_github_repository".to_string())
+                } else if !seen.insert(candidate.repo.to_ascii_lowercase()) {
+                    Some("duplicate_repository".to_string())
+                } else {
+                    None
+                }
+            };
+            DiscoveryCandidateDecision {
+                candidate,
+                eligible: reason.is_none(),
+                reason,
+            }
         })
         .collect()
 }
@@ -901,17 +1264,29 @@ async fn health() -> &'static str {
 }
 
 async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    if state.service.db.health_check().await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let metrics = state.service.metrics();
     let scans = metrics
         .get("scans_total")
         .and_then(|v| v.as_i64())
         .unwrap_or(-1);
-    if scans < 0 {
+    let discovery_requires_token = env_flag("AI_SUPPLY_CHAIN_TRUST_DAEMON")
+        && !env_flag("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISABLE_DISCOVERY");
+    if scans < 0 || (discovery_requires_token && !state.discovery_token_configured) {
         Err(StatusCode::SERVICE_UNAVAILABLE)
     } else {
-        Ok(Json(
-            json!({"status":"ok","db":"connected","scans_total":scans}),
-        ))
+        Ok(Json(json!({
+            "status":"ok",
+            "db":"connected",
+            "storage_backend": state.service.db.backend(),
+            "scans_total":scans,
+            "discovery": {
+                "enabled": discovery_requires_token,
+                "github_token_configured": state.discovery_token_configured
+            }
+        })))
     }
 }
 
@@ -919,21 +1294,38 @@ async fn api_health() -> Json<Value> {
     Json(json!({"status":"ok","role":"rust"}))
 }
 
-async fn api_healthz(State(state): State<AppState>) -> Json<Value> {
+async fn api_healthz(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    if state.service.db.health_check().await.is_err() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let discovery_requires_token = env_flag("AI_SUPPLY_CHAIN_TRUST_DAEMON")
+        && !env_flag("AI_SUPPLY_CHAIN_TRUST_DAEMON_DISABLE_DISCOVERY");
+    if discovery_requires_token && !state.discovery_token_configured {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let m = state.service.metrics();
-    Json(
-        json!({"status":"ok","db":"connected","scans_total":m.get("scans_total").cloned().unwrap_or(json!(0))}),
-    )
+    Ok(Json(json!({
+        "status":"ok",
+        "db":"connected",
+        "storage_backend": state.service.db.backend(),
+        "scans_total":m.get("scans_total").cloned().unwrap_or(json!(0)),
+        "discovery_token_configured": state.discovery_token_configured
+    })))
 }
-async fn api_index() -> Json<Value> {
-    Json(json!({
+async fn api_index(State(state): State<AppState>) -> Json<Value> {
+    Json(api_index_payload(&state.base_url))
+}
+
+fn api_index_payload(base_url: &str) -> Value {
+    let base_url = base_url.trim_end_matches('/');
+    json!({
         "service": "ai-supply-chain-trust",
         "version": "2.0.0-rust",
         "description": "Ready-to-use security context for public repositories: fixed-risk history, disclosed intelligence, recurring weak spots, and variant leads.",
         "access": "public repositories only. Free, no auth. Results are public.",
-        "auth": "none (public, rate-limited per IP)",
-        "base_url": "https://ai-supply-chain-trust.aibim.ai",
-        "docs": "https://ai-supply-chain-trust.aibim.ai/api/v1/openapi.json",
+        "auth": "none (public; selected creation routes use repository-keyed request limits; rescan queue is bounded)",
+        "base_url": base_url,
+        "docs": format!("{base_url}/api/v1/openapi.json"),
         "artifacts": {
             "security_context_json": "/r/{owner}/{repo}.json",
             "security_context_md": "/r/{owner}/{repo}.md",
@@ -961,6 +1353,7 @@ async fn api_index() -> Json<Value> {
             {"method": "GET", "path": "/api/v1/metrics/prometheus", "summary": "Prometheus metrics"},
             {"method": "GET", "path": "/api/v1/events", "summary": "SSE event stream"},
             {"method": "GET", "path": "/api/v1/jobs", "summary": "Recent scan jobs"},
+            {"method": "GET", "path": "/api/v1/discovery/cycles", "summary": "Recent repository discovery cycles", "query": {"limit": "int"}},
             {"method": "GET", "path": "/api/v1/queue/stats", "summary": "Queue stats"},
             {"method": "GET", "path": "/api/v1/ops/failures", "summary": "Open failure inbox", "query": {"status": "open|acknowledged|resolved|all", "limit": "int"}},
             {"method": "POST", "path": "/api/v1/ops/failures/{id}/retry", "summary": "Retry failed scan or evidence work", "body": {"priority": "int"}},
@@ -980,7 +1373,7 @@ async fn api_index() -> Json<Value> {
             {"name": "get_vulnerability_leads", "description": "Get vulnerability variant-analysis leads"},
             {"name": "create_security_context", "description": "Create or refresh security context for a repo"}
         ]
-    }))
+    })
 }
 
 pub fn openapi_schema() -> Value {
@@ -1014,6 +1407,7 @@ pub fn openapi_schema() -> Value {
             "/api/v1/metrics/prometheus": {"get": {"summary": "Prometheus metrics", "responses":{"200":{"content":{"text/plain":{}}}}}},
             "/api/v1/events": {"get": {"summary": "SSE event stream", "responses":{"200":{"content":{"text/event-stream":{}}}}}},
             "/api/v1/jobs": {"get": {"summary": "Recent scan jobs", "parameters":[{"name":"limit","in":"query","schema":{"type":"integer"}}],"responses":{"200":{"description":"Recent scan jobs"}}}},
+            "/api/v1/discovery/cycles": {"get": {"summary": "Recent repository discovery cycles", "parameters":[{"name":"limit","in":"query","schema":{"type":"integer"}}],"responses":{"200":{"description":"Discovery cycle audit records"}}}},
             "/api/v1/queue/stats": {"get": {"summary": "Queue stats", "responses":{"200":{"description":"Queue statistics"}}}},
             "/api/v1/ops/failures": {"get": {"summary": "Open failure inbox", "parameters":[{"name":"status","in":"query","schema":{"type":"string","enum":["open","acknowledged","resolved","all"]}},{"name":"limit","in":"query","schema":{"type":"integer"}}],"responses":{"200":{"description":"Failure alerts"}}}},
             "/api/v1/ops/failures/{id}/retry": {"post": {"summary": "Retry failed scan or evidence work", "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer"}}],"requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"priority":{"type":"integer"}}}}}},"responses":{"200":{"description":"Failure retry queued"}}}},
@@ -1156,6 +1550,8 @@ struct CreateCtxBody {
 }
 async fn create_context(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     axum::extract::Json(b): axum::extract::Json<CreateCtxBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let repo = validate_repo(&b.repo).map_err(|error| {
@@ -1174,8 +1570,9 @@ async fn create_context(
     }
 
     {
+        let requester = requester_key(peer.map(|ConnectInfo(peer)| peer), &headers);
         let mut rl = state.rate_limiter.lock().await;
-        if !rl.check_repo(&repo) {
+        if !admit_request(&mut rl, &repo, &requester) {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"error":"rate_limited","code":"post_rate_limit"})),
@@ -1217,6 +1614,7 @@ struct FeedbackBody {
 
 async fn feedback_handler(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     axum::extract::Json(body): axum::extract::Json<FeedbackBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
@@ -1246,14 +1644,10 @@ async fn feedback_handler(
         .map(validate_repo)
         .transpose()?;
 
-    let client_key = headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| value.len() <= 64)
-        .unwrap_or("unknown");
+    let client_key = requester_key(peer.map(|ConnectInfo(peer)| peer), &headers);
     {
         let mut limiter = state.feedback_limiter.lock().await;
-        if !limiter.check(client_key) {
+        if !limiter.check(&client_key) {
             return Err(ApiError::too_many_requests());
         }
     }
@@ -1327,6 +1721,8 @@ struct ScanBody {
 
 async fn scan(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     axum::extract::Json(body): axum::extract::Json<ScanBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let repo = validate_repo(&body.repo).map_err(|error| {
@@ -1336,8 +1732,9 @@ async fn scan(
         )
     })?;
     {
+        let requester = requester_key(peer.map(|ConnectInfo(peer)| peer), &headers);
         let mut rl = state.rate_limiter.lock().await;
-        if !rl.check_repo(&repo) {
+        if !admit_request(&mut rl, &repo, &requester) {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"error":"rate_limited","code":"post_rate_limit"})),
@@ -1485,6 +1882,13 @@ async fn queue_stats_handler(State(state): State<AppState>) -> Json<Value> {
 
 async fn jobs_handler(State(state): State<AppState>, Query(p): Query<RecentQuery>) -> Json<Value> {
     Json(state.service.scan_jobs_recent(p.limit.unwrap_or(50)))
+}
+
+async fn discovery_cycles_handler(
+    State(state): State<AppState>,
+    Query(p): Query<RecentQuery>,
+) -> Json<Value> {
+    Json(json!({"cycles": state.service.db.discovery_cycles_recent(p.limit.unwrap_or(20))}))
 }
 
 #[derive(Deserialize)]
@@ -1669,12 +2073,16 @@ struct RescanBody {
 }
 async fn queue_rescan_handler(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     axum::extract::Json(b): axum::extract::Json<RescanBody>,
 ) -> Result<Json<Value>, ApiError> {
     let repo = validate_repo(&b.repo)?;
+    let priority = b.priority.unwrap_or(0).clamp(-100, 100);
     {
+        let requester = requester_key(peer.map(|ConnectInfo(peer)| peer), &headers);
         let mut limiter = state.rate_limiter.lock().await;
-        if !limiter.check_repo(&repo) {
+        if !admit_request(&mut limiter, &repo, &requester) {
             return Err(ApiError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "rate_limited",
@@ -1682,9 +2090,16 @@ async fn queue_rescan_handler(
             });
         }
     }
-    let priority = b.priority.unwrap_or(0).clamp(-100, 100);
-    match state.service.enqueue_rescan(&repo, priority) {
-        Ok(job_id) => Ok(Json(json!({"status":"queued", "job_id": job_id}))),
+    match state
+        .service
+        .enqueue_rescan_with_capacity(&repo, priority, state.max_queued_scans)
+    {
+        Ok(Some(job_id)) => Ok(Json(json!({"status":"queued", "job_id": job_id}))),
+        Ok(None) => Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "queue_full",
+            message: "Scan queue is at capacity; please try again later".into(),
+        }),
         Err(error) => Err(ApiError::internal(error)),
     }
 }
@@ -1757,9 +2172,31 @@ async fn prometheus_metrics(
         .get("llm_latency_samples_total")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let discovery_cycles = m
+        .get("discovery_cycles_total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let discovery_cycles_failed = m
+        .get("discovery_cycles_failed")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let discovery_candidates = m
+        .get("discovery_candidates_total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let discovery_queued_today = m
+        .get("discovery_queued_today")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let mut text = format!(
         "# HELP ai_supply_chain_trust_scans_total Total evaluations\n# TYPE ai_supply_chain_trust_scans_total counter\nai_supply_chain_trust_scans_total {scans}\n# HELP ai_supply_chain_trust_unique_repos Unique repositories\n# TYPE ai_supply_chain_trust_unique_repos gauge\nai_supply_chain_trust_unique_repos {unique}\n# HELP ai_supply_chain_trust_llm_decisions_total LLM decision records by source/model/task\n# TYPE ai_supply_chain_trust_llm_decisions_total counter\nai_supply_chain_trust_llm_decisions_total {llm_total}\n# HELP ai_supply_chain_trust_llm_hallucination_rejections_total LLM outputs rejected by deterministic fact checking\n# TYPE ai_supply_chain_trust_llm_hallucination_rejections_total counter\nai_supply_chain_trust_llm_hallucination_rejections_total {llm_rejected}\n# HELP ai_supply_chain_trust_llm_hallucination_rejection_rate Rejected LLM decisions divided by total LLM decisions\n# TYPE ai_supply_chain_trust_llm_hallucination_rejection_rate gauge\nai_supply_chain_trust_llm_hallucination_rejection_rate {llm_rejection_rate}\n# HELP ai_supply_chain_trust_llm_rate_limited_total LLM outcomes caused by upstream HTTP 429\n# TYPE ai_supply_chain_trust_llm_rate_limited_total counter\nai_supply_chain_trust_llm_rate_limited_total {llm_rate_limited}\n# HELP ai_supply_chain_trust_llm_model_missing_total LLM decision records without model metadata\n# TYPE ai_supply_chain_trust_llm_model_missing_total gauge\nai_supply_chain_trust_llm_model_missing_total {llm_model_missing}\n# HELP ai_supply_chain_trust_llm_latency_average_ms Average latency of persisted LLM outcomes with latency data\n# TYPE ai_supply_chain_trust_llm_latency_average_ms gauge\nai_supply_chain_trust_llm_latency_average_ms {llm_latency_average_ms}\n# HELP ai_supply_chain_trust_llm_latency_samples_total Persisted LLM outcomes with latency data\n# TYPE ai_supply_chain_trust_llm_latency_samples_total counter\nai_supply_chain_trust_llm_latency_samples_total {llm_latency_samples}\n"
     );
+    text.push_str(&format!(
+        "# HELP ai_supply_chain_trust_discovery_cycles_total Completed and failed discovery cycles\n# TYPE ai_supply_chain_trust_discovery_cycles_total counter\nai_supply_chain_trust_discovery_cycles_total {discovery_cycles}\n# HELP ai_supply_chain_trust_discovery_cycles_failed Total discovery cycles marked failed\n# TYPE ai_supply_chain_trust_discovery_cycles_failed counter\nai_supply_chain_trust_discovery_cycles_failed {discovery_cycles_failed}\n# HELP ai_supply_chain_trust_discovery_candidates_total Candidate records retained for auditability\n# TYPE ai_supply_chain_trust_discovery_candidates_total counter\nai_supply_chain_trust_discovery_candidates_total {discovery_candidates}\n"
+    ));
+    text.push_str(&format!(
+        "# HELP ai_supply_chain_trust_discovery_queued_today Discovery queue admissions since UTC midnight\n# TYPE ai_supply_chain_trust_discovery_queued_today gauge\nai_supply_chain_trust_discovery_queued_today {discovery_queued_today}\n"
+    ));
     let runtime_calls = runtime
         .get("calls_total")
         .and_then(Value::as_u64)
@@ -2077,6 +2514,8 @@ fn mcp_config_html(initial_client: &str) -> String {
 
 async fn mcp_handler(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     axum::extract::Json(body): axum::extract::Json<Value>,
 ) -> Json<Value> {
     let method = body.get("method").and_then(Value::as_str).unwrap_or("");
@@ -2124,6 +2563,15 @@ async fn mcp_handler(
                             json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":"Invalid repository; expected owner/repository"}]}}),
                         );
                     };
+                    {
+                        let requester = requester_key(peer.map(|ConnectInfo(peer)| peer), &headers);
+                        let mut limiter = state.rate_limiter.lock().await;
+                        if !admit_request(&mut limiter, &repo, &requester) {
+                            return Json(
+                                json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":"Too many requests for this repository; please try again later"}]}}),
+                            );
+                        }
+                    }
                     let permit =
                         acquire_permit(&state.scan_permits, "Scan capacity is currently full");
                     if permit.is_err() {
@@ -2232,6 +2680,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::response::Response;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio_stream::StreamExt;
 
     async fn response_text(response: Response) -> String {
@@ -2241,9 +2691,58 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 response")
     }
 
+    async fn github_discovery_server() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = vec![0; 8192];
+            let read = socket.read(&mut raw).await.unwrap();
+            let request = String::from_utf8_lossy(&raw[..read]).to_string();
+            let body = json!({"items": [{
+                "full_name": "owner/mock-repo",
+                "stargazers_count": 7,
+                "description": "deterministic worker fixture"
+            }]})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{address}"), task)
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         assert_eq!(health().await, "healthy\n");
+    }
+
+    #[tokio::test]
+    async fn readiness_checks_storage_and_reports_backend() {
+        let state = AppState {
+            service: Arc::new(Service::new(
+                Arc::new(Database::open_memory().unwrap()),
+                None,
+            )),
+            base_url: "http://localhost".to_string(),
+            worker_token: None,
+            discovery_token_configured: true,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
+            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
+        };
+
+        let response = healthz(State(state.clone())).await.expect("ready response");
+        assert_eq!(response.0["storage_backend"], json!("sqlite"));
+        assert_eq!(response.0["status"], json!("ok"));
+
+        let api_response = api_healthz(State(state)).await.expect("API ready response");
+        assert_eq!(api_response.0["storage_backend"], json!("sqlite"));
     }
 
     #[test]
@@ -2269,7 +2768,9 @@ mod tests {
             service,
             base_url: "http://localhost".to_string(),
             worker_token: None,
+            discovery_token_configured: false,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
             feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
             scan_permits: Arc::new(Semaphore::new(4)),
             sse_permits: Arc::new(Semaphore::new(100)),
@@ -2346,6 +2847,232 @@ mod tests {
     }
 
     #[test]
+    fn discovery_candidates_keep_unique_valid_github_repositories() {
+        use ai_supply_chain_trust_discovery::DiscoveredRepo;
+
+        let candidates = discovery_candidates(
+            vec![
+                DiscoveredRepo {
+                    repo: "Owner/Repo".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 5,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "owner/repo".into(),
+                    source: "github:topic:ai-agent".into(),
+                    stars: 8,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "pypi:not-a-github-repo".into(),
+                    source: "pypi:search:llm".into(),
+                    stars: 99,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "owner/low-star".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 4,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "owner/repo/extra".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 99,
+                    description: String::new(),
+                },
+            ],
+            5,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].repo, "Owner/Repo");
+    }
+
+    #[test]
+    fn discovery_candidate_decisions_keep_every_rejection_reason() {
+        use ai_supply_chain_trust_discovery::DiscoveredRepo;
+
+        let decisions = discovery_candidate_decisions(
+            vec![
+                DiscoveredRepo {
+                    repo: "owner/accepted".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 5,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "owner/accepted".into(),
+                    source: "github:topic:ai".into(),
+                    stars: 5,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "owner/low".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 4,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "not-a-repo".into(),
+                    source: "github:topic:llm".into(),
+                    stars: 8,
+                    description: String::new(),
+                },
+                DiscoveredRepo {
+                    repo: "pypi:package".into(),
+                    source: "pypi:search".into(),
+                    stars: 8,
+                    description: String::new(),
+                },
+            ],
+            5,
+        );
+
+        assert_eq!(decisions.iter().filter(|entry| entry.eligible).count(), 1);
+        assert_eq!(decisions[1].reason.as_deref(), Some("duplicate_repository"));
+        assert_eq!(decisions[2].reason.as_deref(), Some("below_minimum_stars"));
+        assert_eq!(
+            decisions[3].reason.as_deref(),
+            Some("invalid_github_repository")
+        );
+        assert_eq!(decisions[4].reason.as_deref(), Some("source_is_not_github"));
+    }
+
+    #[test]
+    fn discovery_requires_a_non_empty_github_token() {
+        assert_eq!(configured_discovery_token(None), None);
+        assert_eq!(configured_discovery_token(Some("  ".into())), None);
+        assert_eq!(
+            configured_discovery_token(Some("github-token".into())),
+            Some("github-token".into())
+        );
+    }
+
+    #[test]
+    fn discovery_topics_are_bounded_deduplicated_and_query_safe() {
+        assert_eq!(
+            configured_discovery_topics(Some("LLM, ai-agent, llm, invalid/topic, -bad, valid-2")),
+            vec!["llm", "ai-agent", "valid-2"]
+        );
+        assert_eq!(
+            configured_discovery_topics(Some("bad topic")),
+            ai_supply_chain_trust_discovery::default_github_topics()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_cycle_persists_mocked_github_candidate_and_queue_job() {
+        let (github_base, request) = github_discovery_server().await;
+        let db = Arc::new(Database::open_memory().unwrap());
+        let service = Arc::new(Service::new(db.clone(), None));
+        let mut client = ai_supply_chain_trust_discovery::DiscoveryClient::with_timeout(
+            Some("test-token".into()),
+            2,
+        )
+        .with_github_api_base(github_base);
+        let config = DiscoveryWorkerConfig {
+            limit: 1,
+            min_stars: 5,
+            created_days: 7,
+            daily_budget: 1,
+            queue_capacity: 10,
+            topics: vec!["mock-topic".into()],
+        };
+
+        run_discovery_cycle(&service, &mut client, &config).await;
+
+        let request = request.await.unwrap();
+        assert!(request.starts_with("GET /search/repositories?"));
+        assert!(request.contains("topic:mock-topic"));
+        assert!(
+            request.contains("stars:%3E=5") || request.contains("stars:>=5"),
+            "unexpected GitHub search request: {request}"
+        );
+
+        let cycles = db.discovery_cycles_recent(1);
+        assert_eq!(cycles[0]["status"], json!("completed"));
+        assert_eq!(cycles[0]["discovered_count"], json!(1));
+        assert_eq!(cycles[0]["eligible_count"], json!(1));
+        assert_eq!(cycles[0]["queued_count"], json!(1));
+        assert_eq!(cycles[0]["config"]["topics"], json!(["mock-topic"]));
+        assert_eq!(db.scan_jobs_recent(1)[0]["repo"], json!("owner/mock-repo"));
+    }
+
+    #[tokio::test]
+    async fn rescan_queue_rejects_new_jobs_at_capacity() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let service = Arc::new(Service::new(db, None));
+        service.enqueue_rescan("first/repo", 0).unwrap();
+        let state = AppState {
+            service,
+            base_url: "http://localhost".to_string(),
+            worker_token: None,
+            discovery_token_configured: false,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 1,
+            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
+        };
+
+        let error = queue_rescan_handler(
+            State(state),
+            None,
+            HeaderMap::new(),
+            axum::extract::Json(RescanBody {
+                repo: "second/repo".to_string(),
+                priority: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "queue_full");
+    }
+
+    #[tokio::test]
+    async fn mcp_context_creation_uses_repository_rate_limit() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = AppState {
+            service: Arc::new(Service::new(db, None)),
+            base_url: "http://localhost".to_string(),
+            worker_token: None,
+            discovery_token_configured: false,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(1, 60))),
+            max_queued_scans: 100,
+            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
+        };
+        assert!(state.rate_limiter.lock().await.check_repo("owner/repo"));
+
+        let response = mcp_handler(
+            State(state),
+            None,
+            HeaderMap::new(),
+            axum::extract::Json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_security_context",
+                    "arguments": {"repo": "owner/repo"}
+                }
+            })),
+        )
+        .await;
+
+        assert_eq!(response.0["result"]["isError"], json!(true));
+        assert_eq!(
+            response.0["result"]["content"][0]["text"],
+            json!("Too many requests for this repository; please try again later")
+        );
+    }
+
+    #[test]
     fn feedback_origin_must_match_public_base_url() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2373,6 +3100,55 @@ mod tests {
         assert!(limiter.check("203.0.113.9"));
         assert!(!limiter.check("203.0.113.9"));
         assert!(limiter.check("203.0.113.10"));
+    }
+
+    #[test]
+    fn requester_identity_accepts_forwarded_ip_only_from_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.9, 192.0.2.4".parse().unwrap(),
+        );
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        let peer = "192.0.2.10:443".parse().unwrap();
+
+        assert_eq!(
+            requester_key_with_trusted_proxies(Some(peer), &headers, &HashSet::new()),
+            "ip:192.0.2.10"
+        );
+        assert_eq!(
+            requester_key_with_trusted_proxies(
+                Some(peer),
+                &headers,
+                &["192.0.2.10".parse().unwrap()].into_iter().collect(),
+            ),
+            "ip:198.51.100.9"
+        );
+    }
+
+    #[test]
+    fn requester_admission_limits_repository_rotation() {
+        let mut limiter = RateLimiter::new(2, 60);
+        assert!(admit_request(&mut limiter, "owner/one", "ip:198.51.100.9"));
+        assert!(admit_request(&mut limiter, "owner/two", "ip:198.51.100.9"));
+        assert!(!admit_request(
+            &mut limiter,
+            "owner/three",
+            "ip:198.51.100.9"
+        ));
+    }
+
+    #[test]
+    fn allowed_origins_parser_accepts_csv_and_rejects_invalid_headers() {
+        let origins = parse_allowed_origins("https://app.example, https://admin.example").unwrap();
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0], "https://app.example");
+        assert_eq!(origins[1], "https://admin.example");
+        assert!(parse_allowed_origins("*").is_err());
+        assert!(parse_allowed_origins("null").is_err());
+        assert!(parse_allowed_origins("https://app.example/path").is_err());
+        assert!(parse_allowed_origins("https://user@app.example").is_err());
+        assert!(parse_allowed_origins("https://app.example\ninvalid").is_err());
     }
 
     #[tokio::test]
@@ -2404,6 +3180,16 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "Missing browser API path {path}");
         }
+    }
+
+    #[test]
+    fn api_index_describes_actual_admission_controls() {
+        let index = api_index_payload("https://example.test");
+        let auth = index["auth"].as_str().expect("auth description");
+        assert!(auth.contains("repository-keyed"));
+        assert!(!auth.contains("per IP"));
+        assert_eq!(index["base_url"], "https://example.test");
+        assert_eq!(index["docs"], "https://example.test/api/v1/openapi.json");
     }
 
     #[tokio::test]
@@ -2461,7 +3247,9 @@ mod tests {
             service: Arc::new(Service::new(db, None)),
             base_url: "http://localhost".to_string(),
             worker_token: None,
+            discovery_token_configured: false,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
             feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
             scan_permits: Arc::new(Semaphore::new(4)),
             sse_permits: Arc::new(Semaphore::new(100)),
@@ -2529,7 +3317,9 @@ mod tests {
             service: Arc::new(Service::new(db, None)),
             base_url: "https://example.test".to_string(),
             worker_token: None,
+            discovery_token_configured: false,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
             feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
             scan_permits: Arc::new(Semaphore::new(4)),
             sse_permits: Arc::new(Semaphore::new(100)),
@@ -2574,7 +3364,9 @@ mod tests {
             service: Arc::new(Service::new(db, None)),
             base_url: "https://example.test".to_string(),
             worker_token: None,
+            discovery_token_configured: false,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
             feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
             scan_permits: Arc::new(Semaphore::new(4)),
             sse_permits: Arc::new(Semaphore::new(100)),

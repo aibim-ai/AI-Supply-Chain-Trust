@@ -11,7 +11,6 @@ members = [
     "crates/github_metadata",
     "crates/service",
     "crates/server",
-    "crates/render",
     "crates/auth",
     "crates/scanner_runner",
     "crates/discovery",

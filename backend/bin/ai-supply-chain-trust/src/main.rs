@@ -28,17 +28,21 @@ async fn main() -> anyhow::Result<()> {
     let db_path = cli.db_path.clone();
     let token = cli.token.clone();
     let web_dir = cli.web_dir.clone();
-    if std::env::var("AI_SUPPLY_CHAIN_TRUST_WEB_DIR").is_err() {
+    if std::env::var("AI_SUPPLY_CHAIN_TRUST_WEB_DIR").is_err() && !web_dir.is_empty() {
         std::env::set_var("AI_SUPPLY_CHAIN_TRUST_WEB_DIR", &web_dir);
     }
 
-    let base_url = cli
-        .base_url
-        .unwrap_or_else(|| "http://localhost:8000".to_string());
+    let base_url = cli.base_url.clone();
 
     match cli.command {
         Command::Serve(args) => {
-            let url = base_url.clone();
+            if !args.allowed_origins.trim().is_empty() {
+                std::env::set_var(
+                    "AI_SUPPLY_CHAIN_TRUST_ALLOWED_ORIGINS",
+                    &args.allowed_origins,
+                );
+            }
+            let url = serve_base_url(base_url.as_deref(), &args.host, args.port);
             tracing::info!(host = %args.host, port = args.port, role = %args.role, "Starting server");
 
             match args.role.as_str() {
@@ -91,14 +95,20 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Discover(args) => {
             println!(
-                "Discovering repos (limit_per_source={}, max_total={})...",
-                args.limit_per_source, args.max_total
+                "Discovering new GitHub repos (created in last {} days, min_stars={}, max_total={})...",
+                args.days, args.min_stars, args.max_total
             );
             let mut client = ai_supply_chain_trust_discovery::DiscoveryClient::with_timeout(
-                token,
+                token.clone(),
                 discovery_timeout_seconds(),
             );
-            let repos = client.discover_all(args.limit_per_source).await;
+            let created_since = (chrono::Utc::now()
+                - chrono::Duration::days(args.days.clamp(1, 365)))
+            .format("%Y-%m-%d")
+            .to_string();
+            let repos = client
+                .discover_github_recent(args.limit_per_source, args.min_stars, &created_since)
+                .await;
             println!("Found {} repos:", repos.len());
             for (i, r) in repos.iter().take(args.max_total as usize).enumerate() {
                 println!(
@@ -112,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !args.no_score {
                 println!("\nScoring discovered repos...");
-                let service = make_service(&db_path, None).await?;
+                let service = make_service(&db_path, token).await?;
                 for r in repos.iter().take(args.max_total as usize) {
                     if args.skip_existing && service.get_result(&r.repo).is_some() {
                         continue;
@@ -147,7 +157,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::SecurityContext(args) => {
             let service = make_service(&db_path, token).await?;
-            let ctx = service.get_security_context(&args.repo, "http://localhost:8000");
+            let context_base_url = base_url.as_deref().unwrap_or("http://localhost:8000");
+            let ctx = service.get_security_context(&args.repo, context_base_url);
             if args.format == "markdown" {
                 let md = format!(
                     "# Security Context: {}\n\n```json\n{}\n```\n",
@@ -259,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Daemon(args) => {
             println!(
-                "Starting daemon (discovery every {}s, queue poll every {}s)...",
+                "Starting daemon (GitHub discovery every {}s, queue poll every {}s)...",
                 args.discovery_interval, args.queue_poll_interval
             );
             let mut discovery_client =
@@ -270,37 +281,45 @@ async fn main() -> anyhow::Result<()> {
             let service = make_service(&db_path, token).await?;
             let mut discovery_tick =
                 tokio::time::interval(std::time::Duration::from_secs(args.discovery_interval));
+            let mut queue_tick =
+                tokio::time::interval(std::time::Duration::from_secs(args.queue_poll_interval));
 
             loop {
                 tokio::select! {
                     _ = discovery_tick.tick() => {
                         if !args.no_discovery {
-                            let repos = discovery_client.discover_all(10).await;
-                            let mut scans = tokio::task::JoinSet::new();
-                            let concurrency = std::sync::Arc::new(tokio::sync::Semaphore::new(
-                                args.max_concurrent.max(1),
-                            ));
-                            for r in &repos {
-                                let service = service.clone();
-                                let repo = r.repo.clone();
-                                let concurrency = concurrency.clone();
-                                scans.spawn(async move {
-                                    let _permit = concurrency
-                                        .acquire_owned()
-                                        .await
-                                        .expect("scan semaphore remains open");
-                                    let result = service.run_scan(&repo).await;
-                                    (repo, result)
-                                });
-                            }
-                            while let Some(joined) = scans.join_next().await {
-                                match joined {
-                                    Ok((repo, Err(error))) => {
-                                        tracing::warn!("Scan failed for {}: {}", repo, error);
-                                    }
-                                    Err(error) => tracing::warn!("Scan task failed: {}", error),
-                                    Ok((_, Ok(_))) => {}
+                            let created_since = (chrono::Utc::now()
+                                - chrono::Duration::days(args.discover_days.clamp(1, 365)))
+                            .format("%Y-%m-%d")
+                            .to_string();
+                            let repos = discovery_client
+                                .discover_github_recent(
+                                    args.discover_limit.clamp(1, 100) as i64,
+                                    args.discover_min_stars.max(0),
+                                    &created_since,
+                                )
+                                .await;
+                            for repo in repos.into_iter().take(args.discover_limit.clamp(1, 100)) {
+                                if service.get_result(&repo.repo).is_some() {
+                                    continue;
                                 }
+                                if let Err(error) = service.enqueue_discovery(&repo.repo, 0) {
+                                    tracing::warn!(repo = %repo.repo, %error, "Discovered repository could not be queued");
+                                }
+                            }
+                        }
+                    }
+                    _ = queue_tick.tick() => {
+                        let mut scans = tokio::task::JoinSet::new();
+                        for _ in 0..args.max_concurrent.clamp(1, 20) {
+                            let service = service.clone();
+                            scans.spawn(async move { service.run_next_queued_scan().await });
+                        }
+                        while let Some(joined) = scans.join_next().await {
+                            match joined {
+                                Ok(Err(error)) => tracing::warn!(%error, "Queued scan failed"),
+                                Err(error) => tracing::warn!(%error, "Queued scan task failed"),
+                                Ok(Ok(_)) => {}
                             }
                         }
                     }
@@ -314,6 +333,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn serve_base_url(override_url: Option<&str>, host: &str, port: u16) -> String {
+    override_url.map(str::to_owned).unwrap_or_else(|| {
+        let public_host = if host == "0.0.0.0" { "localhost" } else { host };
+        format!("http://{public_host}:{port}")
+    })
 }
 
 async fn run_netcheck(url: &str, github_token_from_env: bool) -> anyhow::Result<()> {
@@ -404,4 +430,25 @@ async fn make_service(
     Ok(std::sync::Arc::new(
         ai_supply_chain_trust_service::Service::new(db, token),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_base_url;
+
+    #[test]
+    fn serve_base_url_uses_bind_port_unless_overridden() {
+        assert_eq!(
+            serve_base_url(None, "0.0.0.0", 18007),
+            "http://localhost:18007"
+        );
+        assert_eq!(
+            serve_base_url(None, "127.0.0.1", 8080),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            serve_base_url(Some("https://trust.example"), "0.0.0.0", 8000),
+            "https://trust.example"
+        );
+    }
 }

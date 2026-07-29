@@ -94,11 +94,6 @@ fn verify_severity_upgrade(input: &Value, output: &Value) -> Result<(), FactChec
         .or_else(|| output.get("risk_level"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if severity_rank(llm_sev) > severity_rank(rule_sev)
-        && !collect_array_string_field_values(output, "evidence_refs").is_empty()
-    {
-        return Ok(());
-    }
     if severity_rank(llm_sev) > severity_rank(rule_sev) {
         return Err(FactCheckError::UnsupportedSeverityUpgrade);
     }
@@ -288,7 +283,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_severity_upgrade() {
         let input = json!({"rule_based_result": {"severity": "low"}, "evidence": [{"id": "commit_1", "subject": "fix parser bounds"}]});
-        let output = json!({"status": "classified", "severity": "critical", "evidence_refs": [], "rationale": "bounds"});
+        let output = json!({"status": "classified", "severity": "critical", "evidence_refs": ["commit_1"], "rationale": "fix parser bounds"});
         assert!(matches!(
             verify_llm_output(&input, &output),
             Err(FactCheckError::UnsupportedSeverityUpgrade)

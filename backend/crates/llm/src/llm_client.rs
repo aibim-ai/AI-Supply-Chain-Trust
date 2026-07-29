@@ -607,7 +607,27 @@ impl LlmClient {
                 Ok(resp) => {
                     let status = resp.status();
                     let retry_after_seconds = parse_retry_after(resp.headers().get("retry-after"));
-                    let text = resp.text().await.unwrap_or_default();
+                    let mut body = Vec::new();
+                    let mut stream = resp.bytes_stream();
+                    let mut read_error = None;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(chunk) if body.len() + chunk.len() <= MAX_RESPONSE_BYTES => {
+                                body.extend_from_slice(&chunk);
+                            }
+                            Ok(_) => {
+                                read_error = Some("error response exceeds 1 MiB limit");
+                                break;
+                            }
+                            Err(_) => {
+                                read_error = Some("failed to read error response");
+                                break;
+                            }
+                        }
+                    }
+                    let text = read_error
+                        .map(str::to_string)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
                     warn!(task, model, attempt, status = %status, latency_ms, "OpenRouter call failed");
                     let error = LlmUnavailableError::HttpStatus {
                         status: status.as_u16(),
@@ -854,6 +874,22 @@ mod tests {
                 .chat_json_schema("decision", "prompt", &json!({}), &json!({}))
                 .await,
             Err(LlmUnavailableError::HttpStatus { status: 401, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_http_error_bodies_are_truncated() {
+        let endpoint = mock_response("401 Unauthorized", &"x".repeat(MAX_RESPONSE_BYTES + 1)).await;
+        let client = LlmClient::new(config(endpoint)).unwrap();
+
+        let error = client
+            .chat_json_schema("decision", "prompt", &json!({}), &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LlmUnavailableError::HttpStatus { ref message, .. }
+                if message == "error response exceeds 1 MiB limit"
         ));
     }
 

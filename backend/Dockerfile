@@ -27,6 +27,8 @@ RUN mkdir -p /data && chown nobody:nogroup /data && chmod 700 /data
 EXPOSE 8080
 ENV PORT=8080
 ENV AI_SUPPLY_CHAIN_TRUST_DB_PATH=/data/trust.db
+# Production image owns its queue: discover new GitHub repositories and process scans.
+ENV AI_SUPPLY_CHAIN_TRUST_DAEMON=1
 
 USER nobody
 ENTRYPOINT ["/usr/local/bin/ai-supply-chain-trust", "serve"]

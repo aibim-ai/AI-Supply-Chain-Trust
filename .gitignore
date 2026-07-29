@@ -28,3 +28,5 @@ audit_data/
 runs/
 frontend/node_modules/
 frontend/coverage/
+playwright-report/
+frontend/test-results/

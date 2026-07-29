@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 ai-supply-chain-trust-server-new = { path = "../../crates/server" }
-ai-supply-chain-trust-render = { path = "../../crates/render" }
 ai-supply-chain-trust-storage = { path = "../../crates/storage" }
 ai-supply-chain-trust-service = { path = "../../crates/service" }
 ai-supply-chain-trust-cli = { path = "../../crates/cli" }
@@ -20,6 +19,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 ai-supply-chain-trust-intelligence = { path = "../../crates/intelligence" }
@@ -27,4 +27,3 @@ ai-supply-chain-trust-security-context = { path = "../../crates/security_context
 ai-supply-chain-trust-scoring = { path = "../../crates/scoring" }
 ai-supply-chain-trust-evaluator = { path = "../../crates/evaluator" }
 ai-supply-chain-trust-auth = { path = "../../crates/auth" }
-chrono.workspace = true

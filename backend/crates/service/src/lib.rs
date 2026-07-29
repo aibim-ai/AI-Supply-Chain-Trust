@@ -4,7 +4,7 @@
 use ai_supply_chain_trust_evaluator::{evaluate_repository, EvidenceSources};
 use ai_supply_chain_trust_intelligence::{IntelligenceClient, IntelligenceClientConfig};
 use ai_supply_chain_trust_models::scanner::ScannerStatus;
-use ai_supply_chain_trust_models::{EvaluationResult, ScannerRun};
+use ai_supply_chain_trust_models::{EvaluationResult, Finding, Grade, ScannerRun, Severity};
 use ai_supply_chain_trust_scanner_runner::{ScannerResult, ScannerRunner};
 use ai_supply_chain_trust_scoring::pillar_weight;
 use ai_supply_chain_trust_security_context::{
@@ -207,8 +207,38 @@ impl Service {
         } else {
             self.collect_scanner_evidence(repo).await
         };
-        let scanner_runs = scanner_evidence.runs;
-        let tool_outputs = scanner_evidence.outputs;
+        let mut scanner_runs = scanner_evidence.runs;
+        let mut tool_outputs = scanner_evidence.outputs;
+        let dependency_intelligence = intel_result
+            .as_ref()
+            .ok()
+            .and_then(|intel| intel.dependency_intelligence.clone());
+        if let Some(dependency) = dependency_intelligence.as_ref() {
+            let status = match dependency.status.as_str() {
+                "fetched" if dependency.errors.is_empty() => ScannerStatus::Ok,
+                "fetched" => ScannerStatus::Partial,
+                "skipped_fast_scan" => ScannerStatus::Skipped,
+                _ => ScannerStatus::Unavailable,
+            };
+            scanner_runs.push(ScannerRun {
+                tool: "github-sbom-osv".to_string(),
+                status,
+                detail: format!(
+                    "status={}; packages={}; queried={}; malicious_matches={}; errors={}",
+                    dependency.status,
+                    dependency.packages_in_sbom,
+                    dependency.packages_queried,
+                    dependency.malicious_package_matches.len(),
+                    dependency.errors.len(),
+                ),
+                impact: None,
+            });
+            tool_outputs.insert(
+                "github-sbom-osv".to_string(),
+                serde_json::to_value(dependency)
+                    .unwrap_or_else(|_| json!({"status": "serialization_error"})),
+            );
+        }
 
         let evidence_sources = EvidenceSources {
             github_metadata: enriched.clone(),
@@ -222,7 +252,12 @@ impl Service {
             hf_metadata: None,
             artifact_root: None,
             tool_outputs,
-            data_sources: vec!["github".into(), "github_advisories".into(), "osv".into()],
+            data_sources: vec![
+                "github".into(),
+                "github_advisories".into(),
+                "osv".into(),
+                "github_dependency_graph".into(),
+            ],
             scanner_runs,
         };
 
@@ -230,6 +265,7 @@ impl Service {
         let evaluation_started = Instant::now();
         let mut result = evaluate_repository(repo, None, today, evidence_sources);
         apply_evidence_aware_decision(&mut result);
+        apply_dependency_malware_override(&mut result, dependency_intelligence.as_ref());
 
         // 5. Enrich with intel
         if let Some(metrics) = result.observed_metrics.as_object_mut() {
@@ -967,9 +1003,31 @@ impl Service {
             .enqueue_rescan_with_lane(repo, priority, "foreground")
             .map_err(|e| e.to_string())
     }
+
+    pub fn enqueue_rescan_with_capacity(
+        &self,
+        repo: &str,
+        priority: i64,
+        max_queued: usize,
+    ) -> Result<Option<i64>, String> {
+        self.db
+            .enqueue_rescan_with_capacity(repo, priority, max_queued)
+            .map_err(|e| e.to_string())
+    }
     pub fn enqueue_discovery(&self, repo: &str, priority: i64) -> Result<i64, String> {
         self.db
             .enqueue_rescan_with_lane(repo, priority, "background")
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn enqueue_discovery_with_capacity(
+        &self,
+        repo: &str,
+        priority: i64,
+        max_queued: usize,
+    ) -> Result<Option<i64>, String> {
+        self.db
+            .enqueue_rescan_with_capacity(repo, priority, max_queued)
             .map_err(|e| e.to_string())
     }
 
@@ -1933,6 +1991,38 @@ fn apply_evidence_aware_decision(result: &mut EvaluationResult) {
     }
 }
 
+fn apply_dependency_malware_override(
+    result: &mut EvaluationResult,
+    dependency: Option<&ai_supply_chain_trust_intelligence::DependencyIntelligence>,
+) {
+    let Some(dependency) = dependency else {
+        return;
+    };
+    if dependency.malicious_package_matches.is_empty() {
+        return;
+    }
+
+    let matches = dependency
+        .malicious_package_matches
+        .iter()
+        .take(5)
+        .map(|entry| format!("{} ({})", entry.purl, entry.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    result.critical_flags.push(Finding::new(
+        "supply_chain",
+        Severity::Critical,
+        format!("OpenSSF malicious-package record matched: {matches}"),
+    ));
+    result.grade = Grade::F;
+    result.verdict = "Do not approve: malicious dependency evidence".to_string();
+    result.action = "Remove or replace the matched dependency, then rescan".to_string();
+    result.override_applied = true;
+    result
+        .decision_reasons
+        .push("GitHub dependency SBOM matched an OpenSSF malicious-package record".to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2314,5 +2404,39 @@ mod tests {
             result.trust_decision["label"],
             json!("Insufficient evidence for approval")
         );
+    }
+
+    #[test]
+    fn malicious_dependency_evidence_forces_an_explicit_rejection() {
+        let mut result = EvaluationResult::new(
+            "owner/repo",
+            NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            90.0,
+            Grade::A,
+            "Approved",
+            "Use",
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            HashMap::new(),
+            vec![],
+            vec![],
+        );
+        let dependency = ai_supply_chain_trust_intelligence::DependencyIntelligence {
+            status: "fetched".to_string(),
+            malicious_package_matches: vec![
+                ai_supply_chain_trust_intelligence::DependencyOsvMatch {
+                    purl: "pkg:npm/example-malware@1.0.0".to_string(),
+                    id: "MAL-2026-0001".to_string(),
+                    modified: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        apply_dependency_malware_override(&mut result, Some(&dependency));
+
+        assert_eq!(result.grade, Grade::F);
+        assert!(result.override_applied);
+        assert!(result.verdict.contains("malicious dependency"));
+        assert!(result.critical_flags[0].message.contains("MAL-2026-0001"));
     }
 }

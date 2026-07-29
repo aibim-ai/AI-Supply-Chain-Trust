@@ -14,6 +14,7 @@ run_and_record() {
 }
 
 run_and_record security-independence "$ROOT/scripts/security_independence_guard.sh"
+run_and_record deploy-contract "$ROOT/scripts/test_deploy_contract.sh"
 run_and_record rust-format bash -lc "cd '$ROOT/backend' && cargo fmt --all -- --check"
 run_and_record rust-clippy bash -lc "cd '$ROOT/backend' && cargo clippy --workspace --all-targets -- -D warnings"
 run_and_record rust-tests bash -lc "cd '$ROOT/backend' && cargo test --workspace --all-targets"
@@ -23,6 +24,8 @@ run_and_record frontend-lint bash -lc "cd '$ROOT/frontend' && npm run lint"
 run_and_record frontend-tests bash -lc "cd '$ROOT/frontend' && npm test -- --run"
 run_and_record frontend-coverage bash -lc "cd '$ROOT/frontend' && npm run test:coverage"
 run_and_record frontend-build bash -lc "cd '$ROOT/frontend' && npm run build"
+run_and_record frontend-audit bash -lc "cd '$ROOT/frontend' && npm audit --omit=dev --audit-level=critical"
+run_and_record frontend-e2e bash -lc "cd '$ROOT/frontend' && npm run test:e2e"
 
 if command -v cargo-llvm-cov >/dev/null; then
   llvm_cov="${LLVM_COV:-}"
@@ -40,5 +43,11 @@ fi
 
 date -u '+verified_at=%Y-%m-%dT%H:%M:%SZ' > "$EVIDENCE_DIR/summary.txt"
 git -C "$ROOT" rev-parse HEAD | sed 's/^/commit=/' >> "$EVIDENCE_DIR/summary.txt"
+if [[ -n "$(git -C "$ROOT" status --porcelain=v1)" ]]; then
+  echo "worktree_state=dirty" >> "$EVIDENCE_DIR/summary.txt"
+  git -C "$ROOT" status --porcelain=v1 -z | shasum -a 256 | awk '{print "worktree_status_sha256=" $1}' >> "$EVIDENCE_DIR/summary.txt"
+else
+  echo "worktree_state=clean" >> "$EVIDENCE_DIR/summary.txt"
+fi
 echo "status=passed" >> "$EVIDENCE_DIR/summary.txt"
 echo "Evidence written to $EVIDENCE_DIR"

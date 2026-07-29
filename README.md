@@ -16,8 +16,8 @@ Built in Rust. Previously Python; fully ported to a 15-crate workspace.
 # Build
 cd backend && cargo build --release -p ai-supply-chain-trust
 
-# Run server
-cd backend && GITHUB_TOKEN=ghp_xxx cargo run -p ai-supply-chain-trust serve
+# Run worker-capable server: discovers new GitHub repos and processes queued scans
+cd backend && GITHUB_TOKEN=ghp_xxx AI_SUPPLY_CHAIN_TRUST_DAEMON=1 cargo run -p ai-supply-chain-trust serve
 
 # Scan a repo
 cd backend && GITHUB_TOKEN=ghp_xxx cargo run -p ai-supply-chain-trust eval owner/repo

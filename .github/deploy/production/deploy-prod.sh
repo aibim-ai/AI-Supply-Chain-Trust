@@ -153,7 +153,8 @@ prepare_data_dir() {
     return
   fi
   if docker ps --format '{{.Names}}' | grep -qx 'ai-supply-chain-trust-backend-prod'; then
-    docker cp ai-supply-chain-trust-backend-prod:/tmp/trust.db "$DEPLOY_DIR/data/trust.db" 2>/dev/null || true
+    # Runtime state is bind-mounted at /data. /tmp is never the configured DB path.
+    docker cp ai-supply-chain-trust-backend-prod:/data/trust.db "$DEPLOY_DIR/data/trust.db" 2>/dev/null || true
     chmod 0666 "$DEPLOY_DIR/data/trust.db" 2>/dev/null || true
   fi
 }
@@ -245,7 +246,7 @@ verify_backend_frontend() {
 
   echo "=== Backend health check ==="
   wait_for_backend_health
-  run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-backend-prod curl -fsS --max-time 5 http://127.0.0.1:8080/api/v1/health
+  run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-backend-prod curl -fsS --max-time 5 http://127.0.0.1:8080/api/v1/healthz
 
   echo "=== Frontend health check ==="
   run_or_show_logs timeout 8s docker exec ai-supply-chain-trust-frontend-prod wget -q -O - http://127.0.0.1/frontend-health
@@ -270,8 +271,8 @@ verify_public_edge() {
   local attempt
   echo "=== Public edge routing check ==="
   for attempt in $(seq 1 "$attempts"); do
-    if curl -fsS --connect-timeout 5 --max-time 15 "${base_url}/api/v1/health" >/dev/null \
-      && curl -fsS --connect-timeout 5 --max-time 15 "${base_url}/free-tools/assets/js/HomePage.js" >/dev/null; then
+    if curl -fsS --connect-timeout 5 --max-time 15 "${base_url}/api/v1/healthz" >/dev/null \
+      && curl -fsS --connect-timeout 5 --max-time 15 "${base_url}/assets/js/app.js" >/dev/null; then
       echo "Public API and frontend asset are reachable"
       return 0
     fi
@@ -285,42 +286,46 @@ verify_public_edge() {
 check_github_connectivity() {
   local container="$1"
   echo "=== GitHub connectivity check: ${container} ==="
-  timeout 20s docker exec "$container" sh -lc \
-    'curl -4 -fsS --connect-timeout 5 --max-time 15 -D - https://api.github.com/rate_limit -o /tmp/github-rate.json | sed -n "1,20p"; printf "\n--- body ---\n"; sed -n "1,12p" /tmp/github-rate.json' \
-    || echo "GitHub connectivity check failed for ${container}"
+  run_or_show_logs timeout 20s docker exec "$container" sh -lc \
+    'curl -4 -fsS --connect-timeout 5 --max-time 15 -D - https://api.github.com/rate_limit -o /tmp/github-rate.json | sed -n "1,20p"; printf "\n--- body ---\n"; sed -n "1,12p" /tmp/github-rate.json' || return 1
   echo "=== Rust netcheck: ${container} ==="
-  timeout 45s docker exec "$container" ai-supply-chain-trust netcheck https://api.github.com/rate_limit \
-    || echo "Rust netcheck failed for ${container}"
+  run_or_show_logs timeout 45s docker exec "$container" ai-supply-chain-trust netcheck https://api.github.com/rate_limit || return 1
   echo "=== Rust token netcheck: ${container} ==="
-  timeout 45s docker exec "$container" ai-supply-chain-trust netcheck \
+  run_or_show_logs docker exec "$container" sh -lc 'test -n "$GITHUB_TOKEN"' || return 1
+  run_or_show_logs timeout 45s docker exec "$container" ai-supply-chain-trust netcheck \
     https://api.github.com/repos/octocat/hello-world \
-    --github-token-from-env \
-    || echo "Rust token netcheck failed for ${container}"
+    --github-token-from-env || return 1
 }
 
-select_writable_env_file
-ensure_env_file
-sync_secret_env
-prepare_release_permissions
-sync_release
-prepare_data_dir
-cd "$DEPLOY_DIR"
-trap show_logs ERR
-compose build backend frontend
-remove_legacy_containers
-compose up -d --force-recreate --remove-orphans backend frontend
-verify_backend_frontend
-run_or_show_logs compose up -d --force-recreate nginx
-verify_deploy
-run_or_show_logs compose up -d --force-recreate worker nvd-worker
-run_or_show_logs verify_worker_stability
-run_or_show_logs verify_public_edge
-check_github_connectivity ai-supply-chain-trust-backend-prod
-check_github_connectivity ai-supply-chain-trust-worker-prod
+main() {
+  select_writable_env_file
+  ensure_env_file
+  sync_secret_env
+  prepare_release_permissions
+  sync_release
+  prepare_data_dir
+  cd "$DEPLOY_DIR"
+  trap show_logs ERR
+  compose build backend frontend
+  remove_legacy_containers
+  compose up -d --force-recreate --remove-orphans backend frontend
+  verify_backend_frontend
+  run_or_show_logs compose up -d --force-recreate nginx
+  verify_deploy
+  run_or_show_logs compose up -d --force-recreate worker nvd-worker
+  run_or_show_logs verify_worker_stability
+  run_or_show_logs verify_public_edge
+  check_github_connectivity ai-supply-chain-trust-backend-prod
+  check_github_connectivity ai-supply-chain-trust-worker-prod
 
-echo "=== Foreground scan performance gate ==="
-BASE_URL="https://${TRUST_DOMAIN:-ai-supply-chain-trust.aibim.ai}" \
-  CORPUS="octocat/Hello-World" \
-  RUNS=1 \
-  OUTPUT="$DEPLOY_DIR/data/deploy-scan-performance.csv" \
-  "$DEPLOY_DIR/scripts/benchmark_scan_pipeline.sh"
+  echo "=== Foreground scan performance gate ==="
+  BASE_URL="https://${TRUST_DOMAIN:-ai-supply-chain-trust.aibim.ai}" \
+    CORPUS="octocat/Hello-World" \
+    RUNS=1 \
+    OUTPUT="$DEPLOY_DIR/data/deploy-scan-performance.csv" \
+    "$DEPLOY_DIR/scripts/benchmark_scan_pipeline.sh"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

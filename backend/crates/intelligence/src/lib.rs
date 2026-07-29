@@ -6,6 +6,7 @@
 
 #![deny(dead_code)]
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,10 @@ pub mod nvd;
 
 const DEFAULT_MAX_ADVISORY_PAGES: usize = 100;
 const DEFAULT_SECURITY_HISTORY_MAX_PAGES: usize = 1000;
+/// Bound both GitHub's SBOM payload processing and the subsequent OSV request.
+/// The limit is deliberately lower than OSV's API batch ceiling so one repository
+/// cannot turn a scan into an unbounded dependency crawl.
+const DEFAULT_MAX_DEPENDENCY_PACKAGES: usize = 250;
 
 fn last_page_from_link(link: &str) -> Option<i64> {
     link.split(',').find_map(|part| {
@@ -51,6 +56,53 @@ fn parse_github_tokens(github_token: Option<String>) -> Vec<String> {
     tokens
 }
 
+fn dependency_purls_from_sbom(sbom_response: &Value, limit: usize) -> (usize, Vec<String>) {
+    let mut purls = Vec::new();
+    let mut known = HashSet::new();
+    let mut package_references = 0usize;
+    let packages = sbom_response
+        .get("sbom")
+        .and_then(|value| value.get("packages"))
+        .and_then(Value::as_array)
+        .or_else(|| sbom_response.get("packages").and_then(Value::as_array));
+    for package in packages.into_iter().flatten() {
+        for reference in package
+            .get("externalRefs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let is_purl = reference
+                .get("referenceType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("purl"));
+            let Some(purl) = reference.get("referenceLocator").and_then(Value::as_str) else {
+                continue;
+            };
+            // OSV package queries require a versioned purl. The repository
+            // self-reference is not a third-party dependency and is skipped.
+            if is_purl
+                && purl.starts_with("pkg:")
+                && purl.contains('@')
+                && !purl.starts_with("pkg:github/")
+            {
+                package_references = package_references.saturating_add(1);
+                if purls.len() < limit && known.insert(purl.to_string()) {
+                    purls.push(purl.to_string());
+                }
+            }
+        }
+    }
+    (package_references, purls)
+}
+
+/// OpenSSF malicious-packages records use the `MAL-*` OSV database namespace.
+/// Keep this classification intentionally narrow: ordinary OSV/GHSA/CVE matches
+/// remain vulnerability evidence, not a malware assertion.
+fn is_ossf_malicious_package_id(id: &str) -> bool {
+    id.starts_with("MAL-")
+}
+
 // ---------------------------------------------------------------------------
 // Security intelligence result (matches Python IntelligenceResult)
 // ---------------------------------------------------------------------------
@@ -68,6 +120,38 @@ pub struct SecurityIntelligence {
     pub errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecosystem_resolution: Option<Value>,
+    /// Dependency-graph provenance is supplemental evidence.  A repository may
+    /// legitimately have the GitHub dependency graph disabled, so its absence
+    /// never turns into a fabricated clean dependency result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_intelligence: Option<DependencyIntelligence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DependencyIntelligence {
+    /// `fetched`, `unavailable`, or `skipped_fast_scan`.
+    pub status: String,
+    pub package_limit: usize,
+    pub packages_in_sbom: usize,
+    pub packages_queried: usize,
+    pub packages_truncated: usize,
+    /// Versioned purls passed to OSV, retained as bounded audit provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queried_purls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub osv_matches: Vec<DependencyOsvMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub malicious_package_matches: Vec<DependencyOsvMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyOsvMatch {
+    pub purl: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,6 +584,120 @@ impl IntelligenceClient {
         Ok(vulns)
     }
 
+    /// Exports GitHub's SPDX SBOM and checks the bounded set of versioned
+    /// dependency purls against OSV.  This is intentionally supplemental:
+    /// unavailable dependency-graph access is represented explicitly and is
+    /// never interpreted as an empty or clean SBOM.
+    pub async fn collect_dependency_intelligence(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> DependencyIntelligence {
+        let mut result = DependencyIntelligence {
+            status: "unavailable".to_string(),
+            package_limit: DEFAULT_MAX_DEPENDENCY_PACKAGES,
+            ..Default::default()
+        };
+        let url = format!(
+            "{}/repos/{}/{}/dependency-graph/sbom",
+            self.github_api_base, owner, repo
+        );
+        let sbom = match self.github_get(&url).await {
+            Ok(response) => match response.json::<Value>().await {
+                Ok(value) => value,
+                Err(error) => {
+                    result.errors.push(format!("sbom_parse: {error}"));
+                    return result;
+                }
+            },
+            Err(error) => {
+                result.errors.push(format!("sbom: {error:?}"));
+                return result;
+            }
+        };
+
+        let (package_references, purls) =
+            dependency_purls_from_sbom(&sbom, DEFAULT_MAX_DEPENDENCY_PACKAGES);
+        result.packages_in_sbom = package_references;
+        result.packages_truncated = package_references.saturating_sub(purls.len());
+        result.queried_purls = purls;
+        result.packages_queried = result.queried_purls.len();
+
+        if result.queried_purls.is_empty() {
+            result.status = "fetched".to_string();
+            return result;
+        }
+
+        match self.fetch_osv_vulns_for_purls(&result.queried_purls).await {
+            Ok(matches) => {
+                result.malicious_package_matches = matches
+                    .iter()
+                    .filter(|entry| is_ossf_malicious_package_id(&entry.id))
+                    .cloned()
+                    .collect();
+                result.osv_matches = matches;
+                result.status = "fetched".to_string();
+            }
+            Err(error) => {
+                result.errors.push(format!("osv_dependency_batch: {error}"));
+            }
+        }
+        result
+    }
+
+    async fn fetch_osv_vulns_for_purls(
+        &self,
+        purls: &[String],
+    ) -> Result<Vec<DependencyOsvMatch>, String> {
+        let url = format!("{}/v1/querybatch", self.osv_api_base);
+        let body = json!({
+            "queries": purls
+                .iter()
+                .map(|purl| json!({ "package": { "purl": purl } }))
+                .collect::<Vec<_>>(),
+        });
+        let response = timeout(
+            Duration::from_secs(self.timeout_seconds),
+            self.client.post(&url).json(&body).send(),
+        )
+        .await
+        .map_err(|_| "timeout".to_string())?
+        .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("http_{}", response.status().as_u16()));
+        }
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|error| error.to_string())?;
+        let results = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "invalid_response".to_string())?;
+        let mut matches = Vec::new();
+        for (purl, entry) in purls.iter().zip(results) {
+            for vuln in entry
+                .get("vulns")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = vuln.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                matches.push(DependencyOsvMatch {
+                    purl: purl.clone(),
+                    id: id.to_string(),
+                    modified: vuln
+                        .get("modified")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+        }
+        Ok(matches)
+    }
+
     pub async fn fetch_nvd_for_repo(
         &self,
         owner: &str,
@@ -702,6 +900,11 @@ impl IntelligenceClient {
                 "source": "rule",
                 "mode": "fast"
             })),
+            dependency_intelligence: Some(DependencyIntelligence {
+                status: "skipped_fast_scan".to_string(),
+                package_limit: DEFAULT_MAX_DEPENDENCY_PACKAGES,
+                ..Default::default()
+            }),
         })
     }
 
@@ -834,6 +1037,16 @@ impl IntelligenceClient {
             Vec::new()
         };
 
+        let dependency_intelligence = if include_deferred {
+            Some(self.collect_dependency_intelligence(owner, repo).await)
+        } else {
+            Some(DependencyIntelligence {
+                status: "skipped_fast_scan".to_string(),
+                package_limit: DEFAULT_MAX_DEPENDENCY_PACKAGES,
+                ..Default::default()
+            })
+        };
+
         let fetched = !advisories.is_empty()
             || !fix_commits.is_empty()
             || !osv_vulns.is_empty()
@@ -859,6 +1072,7 @@ impl IntelligenceClient {
             commit_count,
             errors,
             ecosystem_resolution,
+            dependency_intelligence,
         })
     }
 
@@ -2218,6 +2432,8 @@ fn infer_package_name(repo: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn extracts_package_identity_from_supported_manifests() {
@@ -2908,6 +3124,93 @@ mod tests {
         assert!(commit.file_evidence_source.is_none());
         assert!(commit.file_evidence_status.is_none());
         assert_eq!(commit.decision_source, "rule_based");
+    }
+
+    #[test]
+    fn dependency_sbom_purls_are_versioned_deduplicated_and_exclude_repository() {
+        let sbom = json!({
+            "sbom": {"packages": [
+                {"externalRefs": [
+                    {"referenceType": "purl", "referenceLocator": "pkg:github/example/repo@main"},
+                    {"referenceType": "purl", "referenceLocator": "pkg:npm/left-pad@1.3.0"}
+                ]},
+                {"externalRefs": [
+                    {"referenceType": "purl", "referenceLocator": "pkg:pypi/requests@2.32.0"},
+                    {"referenceType": "purl", "referenceLocator": "pkg:npm/left-pad@1.3.0"},
+                    {"referenceType": "purl", "referenceLocator": "pkg:npm/unversioned"}
+                ]}
+            ]}
+        });
+
+        assert_eq!(
+            dependency_purls_from_sbom(&sbom, DEFAULT_MAX_DEPENDENCY_PACKAGES),
+            (
+                3,
+                vec![
+                    "pkg:npm/left-pad@1.3.0".to_string(),
+                    "pkg:pypi/requests@2.32.0".to_string(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn malicious_package_classification_is_narrow_to_mal_namespace() {
+        assert!(is_ossf_malicious_package_id("MAL-2026-0001"));
+        assert!(!is_ossf_malicious_package_id("GHSA-vqj2-4v8m-8vrq"));
+        assert!(!is_ossf_malicious_package_id("CVE-2026-1234"));
+    }
+
+    #[tokio::test]
+    async fn dependency_intelligence_records_sbom_provenance_and_malicious_match() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 8192];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.starts_with("GET /repos/acme/demo/dependency-graph/sbom") {
+                    json!({"sbom": {"packages": [{"externalRefs": [
+                        {"referenceType": "purl", "referenceLocator": "pkg:npm/unsafe-malicious-package@1.0.3"},
+                        {"referenceType": "purl", "referenceLocator": "pkg:github/acme/demo@main"}
+                    ]}]}})
+                    .to_string()
+                } else {
+                    assert!(request.starts_with("POST /v1/querybatch"));
+                    json!({"results": [{"vulns": [{
+                        "id": "MAL-2026-6486",
+                        "modified": "2026-06-29T06:01:42Z"
+                    }]}]})
+                    .to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut client = IntelligenceClient::new(None);
+        client.github_api_base = base.clone();
+        client.osv_api_base = base;
+        client.timeout_seconds = 1;
+
+        let result = client.collect_dependency_intelligence("acme", "demo").await;
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(result.status, "fetched", "{:?}", result.errors);
+        assert_eq!(result.packages_in_sbom, 1);
+        assert_eq!(result.packages_queried, 1);
+        assert_eq!(
+            result.queried_purls,
+            vec!["pkg:npm/unsafe-malicious-package@1.0.3"]
+        );
+        assert_eq!(result.malicious_package_matches.len(), 1);
+        assert_eq!(result.malicious_package_matches[0].id, "MAL-2026-6486");
     }
 
     #[test]

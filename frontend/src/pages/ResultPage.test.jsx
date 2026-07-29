@@ -118,6 +118,32 @@ describe("ResultPage", () => {
     expect(screen.getAllByText("2026-07-12").length).toBeGreaterThan(0);
   });
 
+  it("keeps the decision visible when optional history or intelligence fails", async () => {
+    api.history.mockRejectedValue(new Error("history unavailable"));
+    api.intelligence.mockRejectedValue(new Error("intel unavailable"));
+
+    render(
+      <MemoryRouter initialEntries={["/?repo=owner/repo"]}>
+        <ResultPage />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "owner/repo" }),
+    ).toBeTruthy();
+    expect(screen.getByText("0 hits")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Snapshot history is temporarily unavailable. The current decision remains available.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Threat intelligence is temporarily unavailable. Recheck this context later.",
+      ),
+    ).toBeTruthy();
+  });
+
   it("requires a repository query parameter", async () => {
     render(
       <MemoryRouter initialEntries={["/"]}>

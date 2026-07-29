@@ -136,7 +136,9 @@ export default function HomePage() {
 
   async function queueScan(value, candidate = selectedCandidate) {
     if (!isRepository(value))
-      return setError("Search and select a repository first.");
+      return setError(
+        "Enter a public GitHub repository as owner/repository or a github.com URL.",
+      );
     if (selectionTracked.current !== value) {
       selectionTracked.current = value;
       captureProductEvent("valid_repository_selected", {
@@ -250,7 +252,7 @@ export default function HomePage() {
             <div className="hero-input-row">
               <span
                 className={`product-icon product-${product.id}`}
-                aria-label={product.label}
+                aria-hidden="true"
                 title={product.label}
               >
                 <ProductIcon product={product.id} />
@@ -272,8 +274,12 @@ export default function HomePage() {
                 inputMode="url"
                 autoComplete="url"
                 spellCheck="false"
+                role="combobox"
                 aria-autocomplete="list"
                 aria-expanded={dropdownOpen ? "true" : "false"}
+                aria-controls={
+                  dropdownOpen ? "repository-search-results" : undefined
+                }
               />
               <button
                 disabled={busy}
@@ -439,7 +445,11 @@ function SearchDropdown({
       </div>
     );
   return (
-    <div className="search-dropdown" role="listbox">
+    <div
+      className="search-dropdown"
+      id="repository-search-results"
+      role="listbox"
+    >
       <div className="search-dropdown-head">
         <span>Search results</span>
         <strong>Select one to scan</strong>

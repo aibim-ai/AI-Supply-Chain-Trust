@@ -4,8 +4,20 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+pub const DEFAULT_GITHUB_TOPICS: &[&str] = &[
+    "machine-learning",
+    "deep-learning",
+    "llm",
+    "mcp-server",
+    "ai-agent",
+    "transformers",
+    "neural-network",
+    "security-scanner",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredRepo {
@@ -46,6 +58,17 @@ impl DiscoveryClient {
         }
     }
 
+    pub fn with_github_api_base(mut self, base: impl Into<String>) -> Self {
+        self.github_api_base = base.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    pub fn has_github_token(&self) -> bool {
+        self.github_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+    }
+
     async fn throttle(&mut self) {
         if let Some(last) = self.last_call {
             let elapsed = last.elapsed();
@@ -60,7 +83,16 @@ impl DiscoveryClient {
     // GitHub Search — AI/ML repos by topic
     // -------------------------------------------------------------------
     pub async fn discover_github(&mut self, per_query: i64) -> Vec<DiscoveredRepo> {
-        self.discover_github_matching(per_query, "stars:>10", "stars")
+        self.discover_github_with_min_stars(per_query, 5).await
+    }
+
+    pub async fn discover_github_with_min_stars(
+        &mut self,
+        per_query: i64,
+        min_stars: i64,
+    ) -> Vec<DiscoveredRepo> {
+        let qualifiers = format!("stars:>={}", min_stars.max(0));
+        self.discover_github_matching(per_query, &qualifiers, "stars", &default_github_topics())
             .await
     }
 
@@ -68,10 +100,26 @@ impl DiscoveryClient {
         &mut self,
         per_query: i64,
         min_stars: i64,
-        pushed_since: &str,
+        created_since: &str,
     ) -> Vec<DiscoveredRepo> {
-        let qualifiers = format!("stars:>{}+pushed:>={pushed_since}", min_stars.max(0));
-        self.discover_github_matching(per_query, &qualifiers, "updated")
+        self.discover_github_recent_with_topics(
+            per_query,
+            min_stars,
+            created_since,
+            &default_github_topics(),
+        )
+        .await
+    }
+
+    pub async fn discover_github_recent_with_topics(
+        &mut self,
+        per_query: i64,
+        min_stars: i64,
+        created_since: &str,
+        topics: &[String],
+    ) -> Vec<DiscoveredRepo> {
+        let qualifiers = format!("stars:>={}+created:>={created_since}", min_stars.max(0));
+        self.discover_github_matching(per_query, &qualifiers, "created", topics)
             .await
     }
 
@@ -80,20 +128,11 @@ impl DiscoveryClient {
         per_query: i64,
         qualifiers: &str,
         sort: &str,
+        topics: &[String],
     ) -> Vec<DiscoveredRepo> {
-        let topics = [
-            "machine-learning",
-            "deep-learning",
-            "llm",
-            "mcp-server",
-            "ai-agent",
-            "transformers",
-            "neural-network",
-            "security-scanner",
-        ];
         let mut repos = Vec::new();
 
-        for topic in &topics {
+        for topic in topics {
             self.throttle().await;
             let url = format!(
                 "{}/search/repositories?q=topic:{topic}+{qualifiers}&sort={sort}&order=desc&per_page={per_query}",
@@ -125,7 +164,11 @@ impl DiscoveryClient {
                 Err(error) => warn!(topic, %error, "GitHub discovery query failed"),
             }
         }
-        info!("GitHub discovery: {} repos", repos.len());
+        let mut seen = HashSet::new();
+        repos.retain(|candidate| {
+            !candidate.repo.is_empty() && seen.insert(candidate.repo.to_ascii_lowercase())
+        });
+        info!("GitHub discovery: {} unique repos", repos.len());
         repos
     }
 
@@ -221,6 +264,13 @@ impl DiscoveryClient {
     }
 }
 
+pub fn default_github_topics() -> Vec<String> {
+    DEFAULT_GITHUB_TOPICS
+        .iter()
+        .map(|topic| (*topic).to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,7 +359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_github_discovery_applies_freshness_and_star_filters() {
+    async fn recent_github_discovery_uses_creation_date_and_star_filters() {
         let (base, requests) = discovery_server(8).await;
         let mut client = DiscoveryClient::with_timeout(None, 1);
         client.github_api_base = base;
@@ -317,16 +367,39 @@ mod tests {
 
         let repos = client.discover_github_recent(1, 500, "2026-07-06").await;
 
-        assert_eq!(repos.len(), 8);
+        assert_eq!(repos.len(), 1, "topic results must be deduplicated");
         let requests = requests.lock().unwrap();
         assert!(
             requests.iter().all(|request| {
                 request.contains("stars:")
-                    && request.contains("pushed:")
+                    && request.contains("created:")
                     && request.contains("2026-07-06")
-                    && request.contains("sort=updated")
+                    && request.contains("sort=created")
             }),
             "captured requests: {requests:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_topics_replace_the_default_query_set() {
+        let (base, requests) = discovery_server(2).await;
+        let mut client = DiscoveryClient::with_timeout(None, 1);
+        client.github_api_base = base;
+        client.min_interval = Duration::ZERO;
+        let topics = vec!["llm".to_string(), "ai-agent".to_string()];
+
+        client
+            .discover_github_recent_with_topics(1, 5, "2026-07-06", &topics)
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().any(|request| request.contains("topic:llm")));
+        assert!(requests
+            .iter()
+            .any(|request| request.contains("topic:ai-agent")));
+        assert!(!requests
+            .iter()
+            .any(|request| request.contains("topic:machine-learning")));
     }
 }

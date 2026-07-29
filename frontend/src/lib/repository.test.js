@@ -15,4 +15,12 @@ describe("repository input", () => {
     expect(isRepository(normalizeRepository("drupal"))).toBe(false);
     expect(isRepository(normalizeRepository("drupal/drupal"))).toBe(true);
   });
+
+  it("rejects unsupported providers and malformed paths", () => {
+    expect(normalizeRepository("https://gitlab.com/gitlab-org/gitlab")).toBe(
+      "",
+    );
+    expect(normalizeRepository("https://github.com/owner/repo/extra")).toBe("");
+    expect(isRepository("https:/")).toBe(false);
+  });
 });

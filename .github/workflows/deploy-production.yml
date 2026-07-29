@@ -30,3 +30,18 @@ jobs:
 
       - name: Deploy and verify
         run: .github/deploy/production/deploy-prod.sh "$DEPLOY_DIR" "$ENV_FILE"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify public browser release gate
+        working-directory: frontend
+        env:
+          PUBLIC_BASE_URL: https://ai-supply-chain-trust.aibim.ai
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:public-release

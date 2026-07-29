@@ -109,6 +109,8 @@ describe("HomePage", () => {
     const input = screen.getByPlaceholderText(
       "Paste a public GitHub URL or owner/repo",
     );
+    expect(input.getAttribute("role")).toBe("combobox");
+    expect(input.getAttribute("aria-expanded")).toBe("false");
     await user.type(input, "r1z4x");
     const result = await screen.findByText("r1z4x/OWASPAttackSimulator");
 

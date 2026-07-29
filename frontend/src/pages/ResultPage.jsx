@@ -8,12 +8,19 @@ export default function ResultPage() {
     repository = params.get("repo");
   const query = useAsync(async () => {
     if (!repository) throw new Error("A repository is required.");
-    const [report, history, intelligence] = await Promise.all([
-      trustApi.result(repository),
+    const report = await trustApi.result(repository);
+    const [history, intelligence] = await Promise.allSettled([
       trustApi.history(repository),
       trustApi.intelligence(repository),
     ]);
-    return { report, history, intelligence };
+    return {
+      report,
+      history: history.status === "fulfilled" ? history.value : [],
+      historyUnavailable: history.status !== "fulfilled",
+      intelligence:
+        intelligence.status === "fulfilled" ? intelligence.value : {},
+      intelligenceUnavailable: intelligence.status !== "fulfilled",
+    };
   }, [repository]);
   if (query.status === "error")
     return (
@@ -23,7 +30,13 @@ export default function ResultPage() {
     );
   if (query.status === "loading") return <PageLoader />;
 
-  const { report, history, intelligence } = query.data;
+  const {
+    report,
+    history,
+    intelligence,
+    historyUnavailable,
+    intelligenceUnavailable,
+  } = query.data;
   const scap = report.observed_metrics?.scap || {};
   const historyRows = normalizeHistory(history);
   const intelligenceRows = normalizeIntelligence(intelligence);
@@ -145,6 +158,12 @@ export default function ResultPage() {
             </div>
           </div>
           <TrendChart rows={historyRows} />
+          {historyUnavailable && (
+            <p className="form-message" data-state="error" role="status">
+              Snapshot history is temporarily unavailable. The current decision
+              remains available.
+            </p>
+          )}
         </section>
       </div>
 
@@ -160,6 +179,12 @@ export default function ResultPage() {
             rows={intelligenceRows}
             empty="No threat-intelligence hits in the latest report."
           />
+          {intelligenceUnavailable && (
+            <p className="form-message" data-state="error" role="status">
+              Threat intelligence is temporarily unavailable. Recheck this
+              context later.
+            </p>
+          )}
         </section>
         <section className="panel">
           <div className="panel-header">

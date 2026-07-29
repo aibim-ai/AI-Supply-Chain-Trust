@@ -49,5 +49,5 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 jsonwebtoken = "9"
 clap = { version = "4", features = ["derive", "env"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
 dotenvy = "0.15"

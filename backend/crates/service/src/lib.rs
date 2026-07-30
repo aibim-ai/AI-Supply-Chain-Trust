@@ -438,16 +438,19 @@ impl Service {
         repo: &str,
         progressive: bool,
     ) -> Result<Value, String> {
-        if !progressive {
-            return self
-                .fetch_repo_cached(owner, repo)
+        let metadata = if !progressive {
+            self.fetch_repo_cached(owner, repo)
                 .await
-                .map_err(|error| format!("GitHub error: {error}"));
-        }
+                .map_err(|error| format!("GitHub error: {error}"))?
+        } else {
+            let deadline = Duration::from_secs(self.config.foreground_timeout_seconds.max(1));
+            let stale = self.stale_repo_metadata(owner, repo);
+            bounded_foreground_metadata(self.fetch_repo_cached(owner, repo), deadline, stale)
+                .await?
+        };
 
-        let deadline = Duration::from_secs(self.config.foreground_timeout_seconds.max(1));
-        let stale = self.stale_repo_metadata(owner, repo);
-        bounded_foreground_metadata(self.fetch_repo_cached(owner, repo), deadline, stale).await
+        ensure_public_repository(&metadata)?;
+        Ok(metadata)
     }
 
     fn stale_repo_metadata(&self, owner: &str, repo: &str) -> Option<Value> {
@@ -1874,6 +1877,14 @@ fn has_critical_security_intel_errors(errors: &[String]) -> bool {
     })
 }
 
+fn ensure_public_repository(metadata: &Value) -> Result<(), String> {
+    if metadata.get("private").and_then(Value::as_bool) == Some(false) {
+        return Ok(());
+    }
+
+    Err("repository is not public".to_string())
+}
+
 fn is_github_rate_limited_error(error: &str) -> bool {
     error.contains("GitHubRateLimited") || error.contains("github_rate_limited")
 }
@@ -2106,6 +2117,7 @@ mod tests {
             "archived": false,
             "disabled": false,
             "fork": false,
+            "private": false,
             "created_at": "2020-01-01T00:00:00Z",
             "updated_at": "2026-07-12T00:00:00Z",
             "pushed_at": "2026-07-12T00:00:00Z",
@@ -2307,6 +2319,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn private_or_ambiguous_repository_metadata_is_rejected() {
+        assert!(ensure_public_repository(&json!({"private": false})).is_ok());
+        assert_eq!(
+            ensure_public_repository(&json!({"private": true})).unwrap_err(),
+            "repository is not public"
+        );
+        assert_eq!(
+            ensure_public_repository(&json!({"visibility": "public"})).unwrap_err(),
+            "repository is not public"
+        );
+    }
+
     #[tokio::test]
     async fn fast_scan_from_cache_meets_local_latency_budget() {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -2323,6 +2348,32 @@ mod tests {
             "cached fast scan took {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn private_cached_metadata_never_creates_a_report() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut private_metadata = cached_metadata("owner/private-repo");
+        private_metadata["private"] = json!(true);
+        db.put_source_cache(
+            "github_repo:owner/private-repo",
+            "github_repo",
+            &private_metadata,
+            None,
+            None,
+            Some(300),
+        )
+        .unwrap();
+        let service = Service::new(db.clone(), None);
+
+        assert_eq!(
+            service
+                .run_fast_scan("owner/private-repo")
+                .await
+                .unwrap_err(),
+            "repository is not public"
+        );
+        assert!(db.get_report("owner/private-repo").is_none());
     }
 
     #[tokio::test]

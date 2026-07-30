@@ -119,8 +119,25 @@ impl DiscoveryClient {
         topics: &[String],
     ) -> Vec<DiscoveredRepo> {
         let qualifiers = format!("stars:>={}+created:>={created_since}", min_stars.max(0));
-        self.discover_github_matching(per_query, &qualifiers, "created", topics)
-            .await
+        let discovered = self
+            .discover_github_matching(per_query, &qualifiers, "created", topics)
+            .await;
+        if !discovered.is_empty() {
+            return discovered;
+        }
+
+        // Newly created repositories often have not received their GitHub topic yet.
+        // Keep the same freshness and popularity gates, but use a semantic fallback
+        // so an empty topic search does not stop autonomous discovery entirely.
+        self.discover_github_queries(
+            per_query,
+            "created",
+            vec![(
+                "github:fallback:ai".to_string(),
+                format!("ai+in:name,description,readme+{qualifiers}"),
+            )],
+        )
+        .await
     }
 
     async fn discover_github_matching(
@@ -130,12 +147,30 @@ impl DiscoveryClient {
         sort: &str,
         topics: &[String],
     ) -> Vec<DiscoveredRepo> {
+        let queries = topics
+            .iter()
+            .map(|topic| {
+                (
+                    format!("github:topic:{topic}"),
+                    format!("topic:{topic}+{qualifiers}"),
+                )
+            })
+            .collect();
+        self.discover_github_queries(per_query, sort, queries).await
+    }
+
+    async fn discover_github_queries(
+        &mut self,
+        per_query: i64,
+        sort: &str,
+        queries: Vec<(String, String)>,
+    ) -> Vec<DiscoveredRepo> {
         let mut repos = Vec::new();
 
-        for topic in topics {
+        for (source, query) in queries {
             self.throttle().await;
             let url = format!(
-                "{}/search/repositories?q=topic:{topic}+{qualifiers}&sort={sort}&order=desc&per_page={per_query}",
+                "{}/search/repositories?q={query}&sort={sort}&order=desc&per_page={per_query}",
                 self.github_api_base
             );
             match self.github_get(&url).await {
@@ -154,14 +189,14 @@ impl DiscoveryClient {
                                 .unwrap_or("");
                             repos.push(DiscoveredRepo {
                                 repo: full_name.to_string(),
-                                source: format!("github:topic:{topic}"),
+                                source: source.clone(),
                                 stars,
                                 description: desc.to_string(),
                             });
                         }
                     }
                 }
-                Err(error) => warn!(topic, %error, "GitHub discovery query failed"),
+                Err(error) => warn!(source, %error, "GitHub discovery query failed"),
             }
         }
         let mut seen = HashSet::new();
@@ -401,5 +436,23 @@ mod tests {
         assert!(!requests
             .iter()
             .any(|request| request.contains("topic:machine-learning")));
+    }
+
+    #[tokio::test]
+    async fn empty_topic_search_uses_ai_fallback() {
+        let (base, requests) = discovery_server(1).await;
+        let mut client = DiscoveryClient::with_timeout(None, 1);
+        client.github_api_base = base;
+        client.min_interval = Duration::ZERO;
+
+        let repos = client
+            .discover_github_recent_with_topics(1, 5, "2026-07-06", &[])
+            .await;
+
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].source, "github:fallback:ai");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("in:name,description,readme"));
     }
 }

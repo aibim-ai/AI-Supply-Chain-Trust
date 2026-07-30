@@ -9,7 +9,7 @@
   only `runtime-tokio-rustls`, `postgres`, `chrono`, and `uuid`. `cargo tree
   --target all -i rsa` returns no active dependency path; application JWT code
   uses HS256 rather than RSA.
-- Control: `backend/audit.toml` records the no-fixed-release exception. Keep
+- Control: `backend/.cargo/audit.toml` records the no-fixed-release exception. Keep
   SQLx MySQL disabled, rerun `cargo audit` in CI, and remove this exception when
   a fixed RSA release exists or Cargo stops retaining the optional closure.
 - Owner: application security

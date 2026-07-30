@@ -20,6 +20,7 @@ jobs:
     env:
       DEPLOY_DIR: /opt/ai-repo-trust
       ENV_FILE: /opt/ai-repo-trust/.env.prod
+      GITHUB_TOKEN: ${{ secrets.AI_SUPPLY_CHAIN_TRUST_GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:

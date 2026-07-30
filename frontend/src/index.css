@@ -2000,12 +2000,12 @@ p {
 }
 
 .context-metrics .is-active {
-  color: var(--amber);
+  color: #8a5a00;
   font-weight: 700;
 }
 
 .context-metrics .is-active strong {
-  color: var(--amber);
+  color: #8a5a00;
 }
 
 .trust-meter {

@@ -1,5 +1,20 @@
 # Dependency Security Exceptions
 
+## RustSec SQLx optional MySQL dependency — 2026-07-30
+
+- Advisory: `RUSTSEC-2023-0071`, `rsa` `0.9.10`, Marvin timing side channel.
+- Source: Cargo audit scans every package retained in `Cargo.lock`, including
+  SQLx's optional MySQL package closure.
+- Scope assessment: workspace sets `sqlx.default-features = false` and enables
+  only `runtime-tokio-rustls`, `postgres`, `chrono`, and `uuid`. `cargo tree
+  --target all -i rsa` returns no active dependency path; application JWT code
+  uses HS256 rather than RSA.
+- Control: `backend/audit.toml` records the no-fixed-release exception. Keep
+  SQLx MySQL disabled, rerun `cargo audit` in CI, and remove this exception when
+  a fixed RSA release exists or Cargo stops retaining the optional closure.
+- Owner: application security
+- Review by: 2026-08-30
+
 ## React Router advisory feed conflict — 2026-07-30
 
 - Package: `react-router-dom` / `react-router` `7.18.2` (exactly pinned)

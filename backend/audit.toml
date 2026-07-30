@@ -1,0 +1,5 @@
+[advisories]
+# `sqlx-mysql` remains an optional package in Cargo.lock even though the workspace
+# disables SQLx default features and enables PostgreSQL only. RUSTSEC-2023-0071
+# has no fixed release and its affected RSA verification path is not compiled.
+ignore = ["RUSTSEC-2023-0071"]

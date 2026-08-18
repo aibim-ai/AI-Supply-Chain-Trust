@@ -30,10 +30,28 @@ export function siteOrigin() {
 }
 
 export function absoluteUrl(path = "/") {
-  if (/^https?:\/\//i.test(path)) return path;
   const origin = siteOrigin();
   const suffix = String(path || "/");
-  return `${origin}${suffix.startsWith("/") ? "" : "/"}${suffix}`;
+  const candidate = /^https?:\/\//i.test(suffix)
+    ? suffix
+    : `${origin}${suffix.startsWith("/") ? "" : "/"}${suffix}`;
+  return safeUrl(candidate, origin);
+}
+
+// Canonical and og:url end up in an href attribute, and their path segments come
+// from route params (`/r/:owner/:repository`). Resolve through the URL parser and
+// allow only http(s), so no other scheme can ever reach the attribute regardless
+// of what a caller passes in.
+export function safeUrl(value, origin = siteOrigin()) {
+  const fallback = `${origin}/`;
+  try {
+    const parsed = new globalThis.URL(String(value ?? ""), fallback);
+    return parsed.protocol === "https:" || parsed.protocol === "http:"
+      ? parsed.href
+      : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export function pageTitle(text) {
@@ -48,7 +66,9 @@ export function applyDocumentMeta(meta = {}) {
 
   const title = meta.title || SITE_NAME;
   const description = meta.description || "";
-  const url = meta.url || absoluteUrl(meta.path || "/");
+  // Sanitized here as well as in `absoluteUrl`, so a caller-supplied `meta.url`
+  // reaches the href attribute through the same scheme allow-list.
+  const url = safeUrl(meta.url || absoluteUrl(meta.path || "/"));
 
   if (globalThis.document.title !== title) globalThis.document.title = title;
 

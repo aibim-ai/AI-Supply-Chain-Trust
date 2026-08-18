@@ -7,6 +7,7 @@ import {
   applyDocumentMeta,
   pageTitle,
   repositoryJsonLd,
+  safeUrl,
   siteOrigin,
   websiteJsonLd,
 } from "./seo";
@@ -160,5 +161,43 @@ describe("document metadata", () => {
     expect(loaded.subjectOf.reviewBody).toBe(
       "Review with known gaps — Complete missing evidence",
     );
+  });
+});
+
+describe("safeUrl", () => {
+  it("keeps http(s) URLs and normalizes relative paths against the origin", () => {
+    expect(safeUrl("https://example.test/r/a/b")).toBe(
+      "https://example.test/r/a/b",
+    );
+    expect(safeUrl("/r/owner/repo", "https://example.test")).toBe(
+      "https://example.test/r/owner/repo",
+    );
+  });
+
+  it("refuses every non-http(s) scheme reaching the canonical href", () => {
+    // `<link rel=canonical>` is not user-navigable, but the sink is an href
+    // attribute and must not accept a script-bearing scheme on any path.
+    for (const hostile of [
+      "javascript:alert(1)",
+      "JaVaScRiPt:alert(1)",
+      "data:text/html;base64,PHNjcmlwdD4=",
+      "vbscript:msgbox(1)",
+      "file:///etc/passwd",
+    ]) {
+      expect(safeUrl(hostile, "https://example.test")).toBe(
+        "https://example.test/",
+      );
+    }
+  });
+
+  it("falls back to the origin for unparseable input", () => {
+    expect(safeUrl(null, "https://example.test")).toBe("https://example.test/");
+    expect(safeUrl("http://", "https://example.test")).toBe(
+      "https://example.test/",
+    );
+  });
+
+  it("never returns a non-http(s) URL through absoluteUrl", () => {
+    expect(absoluteUrl("javascript:alert(1)")).not.toMatch(/^javascript:/i);
   });
 });

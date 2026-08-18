@@ -21,6 +21,11 @@ services:
       AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_GITHUB_TIMEOUT_SECONDS:-120}
       AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS: ${AI_SUPPLY_CHAIN_TRUST_FOREGROUND_TIMEOUT_SECONDS:-5}
       AI_SUPPLY_CHAIN_TRUST_DAEMON: "0"
+      # The backend now serves HTML documents so it can substitute the
+      # SSR_HEAD/SSR_MAIN placeholders with per-route metadata. It needs the
+      # built frontend shell; the deploy rsyncs it to the host alongside the
+      # compose file. Assets are still served by the frontend container.
+      AI_SUPPLY_CHAIN_TRUST_WEB_DIR: /srv/web
       AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN: ${AI_SUPPLY_CHAIN_TRUST_WORKER_TOKEN:-}
       AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL: ${AI_SUPPLY_CHAIN_TRUST_FEEDBACK_WEBHOOK_URL:-}
       AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL: ${AI_SUPPLY_CHAIN_TRUST_ALERT_WEBHOOK_URL:-}
@@ -29,6 +34,7 @@ services:
       - "8080"
     volumes:
       - /opt/ai-repo-trust/data:/data
+      - /opt/ai-repo-trust/frontend/web:/srv/web:ro
     networks:
       trust-backend:
       aibim-app-network:

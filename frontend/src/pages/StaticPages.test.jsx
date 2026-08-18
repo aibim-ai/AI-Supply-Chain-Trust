@@ -20,6 +20,9 @@ describe("secondary pages", () => {
           grade: "B",
           trust_score: 72.4,
           verdict: "Review with known gaps",
+          evidence_coverage: 0.47,
+          evaluated_at: "2026-07-12T01:00:00Z",
+          next_review_date: "2026-10-12",
         },
       ],
     });
@@ -44,6 +47,54 @@ describe("secondary pages", () => {
     await waitFor(() =>
       expect(api.leaderboard).toHaveBeenLastCalledWith("own"),
     );
+  });
+
+  it("reports the evidence coverage and review age the score is read against", async () => {
+    render(
+      <MemoryRouter>
+        <LeaderboardPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("owner/repo")).toBeTruthy();
+    expect(screen.getByText("47%")).toBeTruthy();
+    expect(screen.getByText("of evidence pillars observed")).toBeTruthy();
+    expect(screen.getByText("2026-07-12")).toBeTruthy();
+    expect(screen.getByText(/next review 2026-10-12/).textContent).toContain(
+      "days ago",
+    );
+    expect(
+      screen.getByRole("columnheader", { name: "Evidence coverage" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "Reviewed" })).toBeTruthy();
+    expect(document.title).toBe(
+      "Repository trust leaderboard | AI Supply Chain Trust",
+    );
+  });
+
+  it("renders an evidence-anchored score only when the row carries one", async () => {
+    api.leaderboard.mockResolvedValue({
+      rows: [
+        { repo: "owner/plain", grade: "A", trust_score: 100 },
+        {
+          repo: "owner/anchored",
+          grade: "A",
+          trust_score: 100,
+          evidence_anchored_score: 47,
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <LeaderboardPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("owner/plain")).toBeTruthy();
+    expect(screen.getAllByText("100/100")).toHaveLength(2);
+    expect(screen.getAllByText("47/100 evidence-anchored")).toHaveLength(1);
+    expect(screen.getAllByText("Not reported")).toHaveLength(2);
+    expect(screen.getAllByText("Not recorded")).toHaveLength(2);
   });
 
   it.each([

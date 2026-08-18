@@ -75,4 +75,20 @@ describe("repository search candidates", () => {
     expect(rows[0].grade).toBe("B");
     expect(rows[0].summary.fixes).toBe(10);
   });
+
+  it("accepts either score field name the scan APIs publish", () => {
+    const [fromSuggestion] = buildSearchCandidates({
+      query: "curl",
+      suggestions: [{ repo: "curl/curl", trust_score: 88, source: "scanned" }],
+      recent: [],
+    });
+    expect(fromSuggestion.score).toBe(88);
+
+    const [fromRecent] = buildSearchCandidates({
+      query: "curl",
+      suggestions: [],
+      recent: [{ repo: "curl/curl", trust_score: 64 }],
+    });
+    expect(fromRecent.score).toBe(64);
+  });
 });

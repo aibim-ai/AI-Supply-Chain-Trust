@@ -5,8 +5,10 @@ use ai_supply_chain_trust_evaluator::{evaluate_repository, EvidenceSources};
 use ai_supply_chain_trust_intelligence::{IntelligenceClient, IntelligenceClientConfig};
 use ai_supply_chain_trust_models::scanner::ScannerStatus;
 use ai_supply_chain_trust_models::{EvaluationResult, Finding, Grade, ScannerRun, Severity};
-use ai_supply_chain_trust_scanner_runner::{ScannerResult, ScannerRunner};
-use ai_supply_chain_trust_scoring::pillar_weight;
+use ai_supply_chain_trust_scanner_runner::{
+    CheckoutOptions, ScannerResult, ScannerRunner, SourceCheckout,
+};
+use ai_supply_chain_trust_scoring::{evidence_anchored_score, pillar_weight};
 use ai_supply_chain_trust_security_context::{
     envelope_from_report, regression_contracts_from_report,
 };
@@ -26,6 +28,7 @@ pub struct Service {
     pub github_token: Option<String>,
     owner_cache: RwLock<HashMap<String, (Instant, Value)>>,
     config: ServiceConfig,
+    scanner_checkout: ScannerCheckoutConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,77 @@ impl Default for ServiceConfig {
             scanner_enabled: true,
         }
     }
+}
+
+/// Bounds for the opt-in repository checkout used by scanners that need a
+/// working tree (everything except Scorecard, which queries GitHub directly).
+///
+/// This is a separate config object rather than three more `ServiceConfig`
+/// fields so that adding it does not force every `ServiceConfig { .. }` literal
+/// in the workspace to change; `Service` reads it from the environment by
+/// default, so an operator can enable checkouts without a code change.
+#[derive(Debug, Clone)]
+pub struct ScannerCheckoutConfig {
+    /// **Off by default.** Cloning arbitrary public repositories onto the
+    /// production host has real disk and security implications, so enabling it
+    /// is an explicit operator decision
+    /// (`AI_SUPPLY_CHAIN_TRUST_SCANNER_SOURCE_CHECKOUT=1`), never a side effect
+    /// of a scan. While off, source-requiring scanners report `no_source` and
+    /// say so plainly instead of implying the repository had nothing to find.
+    pub enabled: bool,
+    /// Wall-clock limit for a single `git clone --depth 1`.
+    pub timeout_seconds: u64,
+    /// Hard cap on checkout size; larger clones are deleted, not scanned.
+    pub max_bytes: u64,
+}
+
+impl Default for ScannerCheckoutConfig {
+    fn default() -> Self {
+        let bounds = CheckoutOptions::default();
+        Self {
+            enabled: scanner_source_checkout_from_env(),
+            timeout_seconds: checkout_bound_from_env(
+                "AI_SUPPLY_CHAIN_TRUST_SCANNER_CHECKOUT_TIMEOUT_SECONDS",
+                bounds.timeout_seconds,
+            ),
+            max_bytes: checkout_bound_from_env(
+                "AI_SUPPLY_CHAIN_TRUST_SCANNER_CHECKOUT_MAX_BYTES",
+                bounds.max_bytes,
+            ),
+        }
+    }
+}
+
+/// Reads a positive checkout bound from the environment, falling back to the
+/// compiled default when the variable is unset, unparseable, or zero.
+///
+/// These are tunable without a rebuild because enabling checkouts makes them
+/// operationally relevant: the size cap is enforced *after* `git clone` returns,
+/// so it bounds what is retained and handed to a scanner, while the timeout is
+/// what actually bounds peak disk usage during the clone.
+fn checkout_bound_from_env(name: &str, default: u64) -> u64 {
+    parse_checkout_bound(std::env::var(name).ok().as_deref(), default)
+}
+
+/// Pure parsing half of [`checkout_bound_from_env`], kept separate so it can be
+/// tested without mutating process-global environment state.
+fn parse_checkout_bound(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Reads the opt-in source-checkout flag from the environment. The default is
+/// `false` whenever the variable is unset or not explicitly truthy.
+pub fn scanner_source_checkout_from_env() -> bool {
+    std::env::var("AI_SUPPLY_CHAIN_TRUST_SCANNER_SOURCE_CHECKOUT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl Service {
@@ -95,7 +169,14 @@ impl Service {
             github_token: primary_github_token,
             owner_cache: RwLock::new(HashMap::new()),
             config,
+            scanner_checkout: ScannerCheckoutConfig::default(),
         }
+    }
+
+    /// Override the repository-checkout bounds (see [`ScannerCheckoutConfig`]).
+    pub fn with_scanner_checkout_config(mut self, checkout: ScannerCheckoutConfig) -> Self {
+        self.scanner_checkout = checkout;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -158,16 +239,7 @@ impl Service {
         let owner_data = owner_result.unwrap_or(json!({}));
 
         let mut enriched = metadata.clone();
-        if let Some(obj) = enriched.as_object_mut() {
-            obj.insert("owner_details".into(), owner_data.clone());
-            if let Some(owner_obj) = obj.get_mut("owner").and_then(Value::as_object_mut) {
-                for key in ["created_at", "followers", "public_repos", "html_url"] {
-                    if let Some(value) = owner_data.get(key) {
-                        owner_obj.insert(key.to_string(), value.clone());
-                    }
-                }
-            }
-        }
+        merge_owner_into_metadata(&mut enriched, &owner_data);
 
         // 2. Collect security intelligence
         let intel_json = match &intel_result {
@@ -314,7 +386,7 @@ impl Service {
 
         // 6. Persist
         let persistence_started = Instant::now();
-        let report_json = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+        let report_json = report_json_from_result(&result)?;
         let evaluation_id = self
             .db
             .insert_report_async(&report_json)
@@ -365,6 +437,23 @@ impl Service {
             .await
             .insert(owner.to_string(), (Instant::now(), value.clone()));
         Ok(value)
+    }
+
+    /// Owner metadata for the finalize pass. A failed lookup degrades to `{}`
+    /// and is never allowed to fail the finalize: the publisher pillars simply
+    /// score the way they did before, and the rest of the enrichment stands.
+    async fn fetch_owner_for_finalize(&self, repo: &str) -> Value {
+        let owner = repo.split('/').next().unwrap_or_default();
+        if owner.is_empty() {
+            return json!({});
+        }
+        match self.fetch_owner_cached(owner).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(repo, error, "Finalize owner metadata fetch failed");
+                json!({})
+            }
+        }
     }
 
     async fn fetch_repo_cached(&self, owner: &str, repo: &str) -> Result<Value, String> {
@@ -475,11 +564,42 @@ impl Service {
         if !self.config.scanner_enabled {
             return ScannerEvidence::default();
         }
-        let mut runner = ScannerRunner::new(format!("https://github.com/{repo}"));
+        let repo_url = format!("https://github.com/{repo}");
+        let mut runner = ScannerRunner::new(&repo_url);
         if let Some(token) = self.github_token.as_deref() {
             runner = runner.with_github_token(token);
         }
-        scanner_evidence_from_results(runner.run_all().await)
+
+        // Opt-in only. `checkout` owns the temporary directory: it is removed
+        // when this scope ends, on every path including a scanner panic.
+        let checkout = self.checkout_source(&repo_url).await;
+        if let Some(checkout) = checkout.as_ref() {
+            runner = runner.with_source(checkout.path().to_string_lossy().into_owned());
+        }
+        let evidence = scanner_evidence_from_results(runner.run_all().await);
+        drop(checkout);
+        evidence
+    }
+
+    /// Shallow-clone the repository when the operator has explicitly enabled
+    /// source checkouts. A failed clone is never fatal — the scanners that
+    /// needed it report `no_source` and the scan continues.
+    async fn checkout_source(&self, repo_url: &str) -> Option<SourceCheckout> {
+        if !self.scanner_checkout.enabled {
+            return None;
+        }
+        let options = CheckoutOptions {
+            timeout_seconds: self.scanner_checkout.timeout_seconds,
+            max_bytes: self.scanner_checkout.max_bytes,
+            ..CheckoutOptions::default()
+        };
+        match SourceCheckout::shallow_clone(repo_url, &options).await {
+            Ok(checkout) => Some(checkout),
+            Err(error) => {
+                tracing::warn!(repo_url, %error, "Scanner source checkout failed");
+                None
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1475,14 +1595,31 @@ impl Service {
                 prepared.evaluation_id
             ));
         }
-        let scanner_evidence = self.collect_scanner_evidence(&prepared.repo).await;
-        report["scanner_runs"] = serde_json::to_value(&scanner_evidence.runs)
+        // The real scanner evidence and the publisher metadata are both inputs
+        // to the re-evaluation below, and they are independent of each other.
+        let (scanner_evidence, owner_data) = tokio::join!(
+            self.collect_scanner_evidence(&prepared.repo),
+            self.fetch_owner_for_finalize(&prepared.repo)
+        );
+        // Keep the runs recorded by the fast pass for sources that do not
+        // re-run at finalize (notably the GitHub SBOM/OSV dependency check),
+        // instead of overwriting the whole list with the scanner-only results.
+        let scanner_runs = merged_scanner_runs(&report, scanner_evidence.runs);
+        report["scanner_runs"] = serde_json::to_value(&scanner_runs)
             .map_err(|error| format!("scanner result serialization failed: {error}"))?;
         if let Some(metrics) = report
             .get_mut("observed_metrics")
             .and_then(Value::as_object_mut)
         {
             metrics.insert("scanner_outputs".into(), json!(scanner_evidence.outputs));
+            // Owner metadata is skipped by the progressive pass, which is why
+            // `owner_metadata` was `{}` on every stored report. It is merged
+            // here — before the re-evaluation — so the publisher pillars can
+            // read `metadata.owner.created_at` / `.public_repos`.
+            metrics.insert("owner_metadata".into(), owner_data.clone());
+            if let Some(metadata) = metrics.get_mut("metadata") {
+                merge_owner_into_metadata(metadata, &owner_data);
+            }
             let (history_head_sha, history_commit_count) =
                 history_identity_from_pages(&prepared.history_pages);
             if let Some(intel) = metrics
@@ -1521,6 +1658,15 @@ impl Service {
             metrics.insert("verification_status".into(), json!("ok"));
             metrics.insert("scan_state".into(), json!("complete"));
         }
+        // Score the report against the evidence that now exists. Without this
+        // the fast pass's empty-evidence scores are what production ships,
+        // while the real evidence sits unused in the same document.
+        rescore_finalized_report(
+            &mut report,
+            &prepared.repo,
+            scanner_evidence.outputs,
+            scanner_runs,
+        );
         self.db
             .insert_report_async(&report)
             .await
@@ -1660,6 +1806,201 @@ impl Service {
     pub fn record_audit(&self, event: &str, repo: Option<&str>, detail: &Value, ip: Option<&str>) {
         self.db.record_audit_event(event, repo, detail, ip).ok();
     }
+}
+
+/// Top-level report keys owned by the evaluation. A key absent from a fresh
+/// evaluation is *removed* rather than left behind: `missing_evidence`,
+/// `critical_flags` and friends are skipped when empty during serialization, so
+/// a plain "copy the keys that exist" merge would strand stale values from the
+/// empty-evidence pass on the finalized report.
+const RESCORED_REPORT_KEYS: &[&str] = &[
+    "trust_score",
+    "evidence_anchored_score",
+    "grade",
+    "verdict",
+    "action",
+    "evidence_coverage",
+    "confidence",
+    "missing_evidence",
+    "decision_reasons",
+    "trust_decision",
+    "next_review_date",
+    "pillar_scores",
+    "critical_flags",
+    "override_applied",
+    "coverage",
+    "scorecard_raw",
+    "data_sources",
+    "scoring_version",
+];
+
+/// `observed_metrics` keys produced by the progressive pipeline rather than by
+/// the evaluator. A re-evaluation must never overwrite these — they carry the
+/// commit history, NVD, dependency and verification state that finalize spent
+/// the whole job collecting.
+const PRESERVED_OBSERVED_METRICS_KEYS: &[&str] = &[
+    "metadata",
+    "repo_metadata",
+    "owner_metadata",
+    "security_intel",
+    "security_context_version",
+    "verification_status",
+    "scan_state",
+    "head_sha",
+    "scanner_outputs",
+];
+
+/// Re-run the evaluation against the evidence finalize has gathered and merge
+/// the scored fields back into the enriched report.
+///
+/// Merging into the existing report (rather than rebuilding it from the new
+/// evaluation) is deliberate: everything the progressive pipeline computed —
+/// `security_intel`, `metadata`, `owner_metadata`, `head_sha`,
+/// `verification_status`, `scan_state` — must survive untouched.
+///
+/// A report without usable metadata keeps its existing scores: re-evaluating
+/// against nothing would replace one wrong answer with another.
+fn rescore_finalized_report(
+    report: &mut Value,
+    repo: &str,
+    mut tool_outputs: HashMap<String, Value>,
+    scanner_runs: Vec<ScannerRun>,
+) {
+    let Some(metadata) = finalize_metadata(report) else {
+        tracing::warn!(
+            repo,
+            "Finalize skipped re-evaluation: report carries no repository metadata"
+        );
+        return;
+    };
+    let today = report
+        .get("evaluated_at")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<chrono::NaiveDate>().ok())
+        .unwrap_or_else(|| Utc::now().date_naive());
+
+    let dependency = report
+        .pointer("/observed_metrics/security_intel/dependency_intelligence")
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<ai_supply_chain_trust_intelligence::DependencyIntelligence>(
+                value,
+            )
+            .ok()
+        });
+    if let Some(dependency) = dependency.as_ref() {
+        if let Ok(value) = serde_json::to_value(dependency) {
+            tool_outputs.insert("github-sbom-osv".to_string(), value);
+        }
+    }
+
+    let evidence_sources = EvidenceSources {
+        github_metadata: metadata,
+        scorecard: tool_outputs.get("scorecard").cloned(),
+        gitleaks: tool_outputs.get("gitleaks").cloned(),
+        pip_audit: tool_outputs.get("pip-audit").cloned(),
+        npm_audit: tool_outputs.get("npm-audit").cloned(),
+        semgrep: tool_outputs.get("semgrep").cloned(),
+        bandit: tool_outputs.get("bandit").cloned(),
+        trivy: tool_outputs.get("trivy").cloned(),
+        hf_metadata: None,
+        artifact_root: None,
+        tool_outputs,
+        data_sources: vec![
+            "github".into(),
+            "github_advisories".into(),
+            "osv".into(),
+            "github_dependency_graph".into(),
+        ],
+        scanner_runs,
+    };
+
+    // Same post-processing chain as `run_scan_mode`, in the same order, so the
+    // fast and finalized paths cannot drift apart.
+    let mut result = evaluate_repository(repo, None, today, evidence_sources);
+    apply_evidence_aware_decision(&mut result);
+    apply_dependency_malware_override(&mut result, dependency.as_ref());
+
+    let rescored = match report_json_from_result(&result) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(repo, error, "Finalize re-evaluation serialization failed");
+            return;
+        }
+    };
+    merge_rescored_report(report, rescored);
+    tracing::info!(
+        repo,
+        trust_score = result.trust_score,
+        evidence_coverage = result.evidence_coverage,
+        confidence = %result.confidence,
+        "Finalize re-evaluated the report against collected evidence"
+    );
+}
+
+/// Repository metadata to evaluate against: the enriched copy finalize just
+/// updated, falling back to the raw GitHub payload.
+fn finalize_metadata(report: &Value) -> Option<Value> {
+    report
+        .pointer("/observed_metrics/metadata")
+        .filter(|value| value.is_object())
+        .or_else(|| {
+            report
+                .pointer("/observed_metrics/repo_metadata")
+                .filter(|value| value.is_object())
+        })
+        .cloned()
+}
+
+fn merge_rescored_report(report: &mut Value, rescored: Value) {
+    let Some(target) = report.as_object_mut() else {
+        return;
+    };
+    let Some(source) = rescored.as_object() else {
+        return;
+    };
+    for key in RESCORED_REPORT_KEYS {
+        match source.get(*key) {
+            Some(value) => {
+                target.insert((*key).to_string(), value.clone());
+            }
+            None => {
+                target.remove(*key);
+            }
+        }
+    }
+    // The evaluator's own `observed_metrics` only ever carries decision fields;
+    // everything the progressive pipeline stored there stays as it is.
+    let (Some(Value::Object(fresh)), Some(Value::Object(metrics))) = (
+        source.get("observed_metrics"),
+        target.get_mut("observed_metrics"),
+    ) else {
+        return;
+    };
+    for (key, value) in fresh {
+        if PRESERVED_OBSERVED_METRICS_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        metrics.insert(key.clone(), value.clone());
+    }
+}
+
+/// Fresh scanner runs first, then any run from the stored report whose tool did
+/// not re-run at finalize, so nothing recorded by the fast pass is dropped.
+fn merged_scanner_runs(report: &Value, fresh: Vec<ScannerRun>) -> Vec<ScannerRun> {
+    let fresh_tools: Vec<String> = fresh.iter().map(|run| run.tool.clone()).collect();
+    let mut runs = fresh;
+    let existing = report
+        .get("scanner_runs")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<ScannerRun>>(value).ok())
+        .unwrap_or_default();
+    for run in existing {
+        if !fresh_tools.contains(&run.tool) {
+            runs.push(run);
+        }
+    }
+    runs
 }
 
 struct PreparedProgressiveFinalize {
@@ -1825,6 +2166,51 @@ fn primary_github_token(tokens: Option<&str>) -> Option<String> {
     })
 }
 
+/// Fold owner metadata into repository metadata the way the pillars expect.
+///
+/// The full owner blob lands on `owner_details`, but the publisher pillars read
+/// `metadata.owner.created_at` and `metadata.owner.public_repos`, so the
+/// account-age and identity-graph signals are copied onto the nested `owner`
+/// object as well. Without this second step the publisher pillars see nothing —
+/// and the brand-new-account auto-fail can never fire.
+fn merge_owner_into_metadata(metadata: &mut Value, owner_data: &Value) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert("owner_details".into(), owner_data.clone());
+    let Some(owner_object) = object.get_mut("owner").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for key in ["created_at", "followers", "public_repos", "html_url"] {
+        if let Some(value) = owner_data.get(key) {
+            owner_object.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// Serialize an evaluation into its stored report shape.
+///
+/// `evidence_anchored_score` is surfaced at the top level here because
+/// `EvaluationResult` (a frozen model this crate does not own) has no field for
+/// it; `apply_evidence_aware_decision` already places the same value inside
+/// `trust_decision` and `observed_metrics`.
+fn report_json_from_result(result: &EvaluationResult) -> Result<Value, String> {
+    let mut report = serde_json::to_value(result).map_err(|error| error.to_string())?;
+    if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "evidence_anchored_score".into(),
+            json!(rounded_anchored_score(&result.pillar_scores)),
+        );
+    }
+    Ok(report)
+}
+
+fn rounded_anchored_score(
+    pillars: &HashMap<String, ai_supply_chain_trust_models::PillarResult>,
+) -> f64 {
+    (evidence_anchored_score(pillars) * 10.0).round() / 10.0
+}
+
 #[derive(Default)]
 struct ScannerEvidence {
     runs: Vec<ScannerRun>,
@@ -1836,11 +2222,18 @@ fn scanner_evidence_from_results(results: Vec<ScannerResult>) -> ScannerEvidence
         .iter()
         .map(|result| ScannerRun {
             tool: result.tool.clone(),
+            // The runner distinguishes more states than the persisted enum can
+            // hold, so the mapping is chosen to keep the operator-facing
+            // meaning intact: a tool we never installed and a repository we
+            // never checked out are things *we* failed to provide
+            // (`unavailable`), while an ecosystem the repository genuinely does
+            // not use is a real skip. The precise reason survives in `detail`.
             status: match result.status.as_str() {
                 "ok" => ScannerStatus::Ok,
-                "skipped" => ScannerStatus::Skipped,
+                "not_applicable" | "skipped" => ScannerStatus::Skipped,
                 "failed" => ScannerStatus::Failed,
                 "partial" => ScannerStatus::Partial,
+                "not_installed" | "no_source" => ScannerStatus::Unavailable,
                 _ => ScannerStatus::Unavailable,
             },
             detail: result.detail.clone(),
@@ -1982,8 +2375,18 @@ fn apply_evidence_aware_decision(result: &mut EvaluationResult) {
     result.confidence = confidence.into();
     result.missing_evidence = missing.clone();
     result.decision_reasons = reasons.clone();
+
+    // `trust_score` divides by the *applicable* weight only, so a repository can
+    // be awarded 100.0/grade A for scoring perfectly on the 47% of the model we
+    // managed to measure. The anchored score divides by the full 100 weight, so
+    // unmeasured evidence earns nothing and the number cannot contradict
+    // `evidence_coverage`. It is additive reporting: `trust_score` and the
+    // grading it feeds are untouched.
+    let anchored_score = rounded_anchored_score(&result.pillar_scores);
+
     result.trust_decision = json!({
         "score": (result.trust_score * 10.0).round() / 10.0,
+        "evidence_anchored_score": anchored_score,
         "grade": result.grade.to_string(),
         "label": result.verdict,
         "action": result.action,
@@ -1999,6 +2402,7 @@ fn apply_evidence_aware_decision(result: &mut EvaluationResult) {
         metrics.insert("confidence".into(), json!(confidence));
         metrics.insert("missing_evidence".into(), json!(result.missing_evidence));
         metrics.insert("decision_reasons".into(), json!(result.decision_reasons));
+        metrics.insert("evidence_anchored_score".into(), json!(anchored_score));
     }
 }
 
@@ -2039,6 +2443,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checkout_bounds_fall_back_to_the_compiled_default() {
+        // Unset, blank, unparseable, negative and zero must all keep the
+        // compiled bound rather than silently disabling the cap: a max_bytes of
+        // 0 would reject every checkout, and a timeout of 0 would abort every
+        // clone instantly.
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("lots"),
+            Some("-1"),
+            Some("0"),
+        ] {
+            assert_eq!(parse_checkout_bound(raw, 4096), 4096, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn checkout_bounds_accept_operator_overrides() {
+        assert_eq!(parse_checkout_bound(Some("268435456"), 4096), 268_435_456);
+        assert_eq!(parse_checkout_bound(Some(" 90 "), 120), 90);
+    }
+
+    #[test]
     fn progressive_history_supplies_verified_head_identity() {
         let pages = vec![
             json!({"page": 2, "count": 2, "commits": [{"sha": "later-page"}]}),
@@ -2063,16 +2491,36 @@ mod tests {
             },
             ScannerResult {
                 tool: "semgrep".into(),
-                status: "unavailable".into(),
-                detail: "binary unavailable".into(),
+                status: "not_installed".into(),
+                detail: "semgrep was not run: the 'semgrep' binary is not installed".into(),
+                output: None,
+                duration_ms: 0,
+            },
+            ScannerResult {
+                tool: "gitleaks".into(),
+                status: "no_source".into(),
+                detail: "gitleaks was not run: source checkout is disabled".into(),
+                output: None,
+                duration_ms: 0,
+            },
+            ScannerResult {
+                tool: "pip-audit".into(),
+                status: "not_applicable".into(),
+                detail: "pip-audit does not apply: no Python manifest".into(),
                 output: None,
                 duration_ms: 0,
             },
         ]);
 
-        assert_eq!(evidence.runs.len(), 2);
+        assert_eq!(evidence.runs.len(), 4);
         assert_eq!(evidence.runs[0].status, ScannerStatus::Ok);
+        // Deployment gaps stay `unavailable`...
         assert_eq!(evidence.runs[1].status, ScannerStatus::Unavailable);
+        assert_eq!(evidence.runs[2].status, ScannerStatus::Unavailable);
+        // ...and only a genuinely inapplicable ecosystem is a skip.
+        assert_eq!(evidence.runs[3].status, ScannerStatus::Skipped);
+        assert!(evidence.runs[1].detail.contains("not installed"));
+        assert!(evidence.runs[2].detail.contains("checkout"));
         assert_eq!(evidence.outputs["scorecard"]["score"], json!(8.0));
         assert!(!evidence.outputs.contains_key("semgrep"));
     }
@@ -2454,6 +2902,338 @@ mod tests {
         assert_eq!(
             result.trust_decision["label"],
             json!("Insufficient evidence for approval")
+        );
+    }
+
+    fn evidence_from(metadata: &Value, tool_outputs: HashMap<String, Value>) -> EvidenceSources {
+        EvidenceSources {
+            github_metadata: metadata.clone(),
+            scorecard: tool_outputs.get("scorecard").cloned(),
+            gitleaks: tool_outputs.get("gitleaks").cloned(),
+            pip_audit: tool_outputs.get("pip-audit").cloned(),
+            npm_audit: tool_outputs.get("npm-audit").cloned(),
+            semgrep: tool_outputs.get("semgrep").cloned(),
+            bandit: tool_outputs.get("bandit").cloned(),
+            trivy: tool_outputs.get("trivy").cloned(),
+            hf_metadata: None,
+            artifact_root: None,
+            tool_outputs,
+            data_sources: vec!["github".into()],
+            scanner_runs: vec![],
+        }
+    }
+
+    /// A report shaped exactly like the progressive fast pass leaves it:
+    /// scored against empty scanner evidence, with the enrichment keys the
+    /// finalize pass later fills in.
+    fn fast_pass_report(repo: &str) -> Value {
+        let metadata = cached_metadata(repo);
+        let mut result = evaluate_repository(
+            repo,
+            None,
+            NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            evidence_from(&metadata, HashMap::new()),
+        );
+        apply_evidence_aware_decision(&mut result);
+        let mut report = report_json_from_result(&result).unwrap();
+        let metrics = report["observed_metrics"].as_object_mut().unwrap();
+        metrics.insert("metadata".into(), metadata.clone());
+        metrics.insert("repo_metadata".into(), metadata);
+        metrics.insert("owner_metadata".into(), json!({}));
+        metrics.insert(
+            "security_intel".into(),
+            json!({"commit_count": 120, "head_sha": "abc123", "fix_commits": [{"sha": "abc123"}], "nvd_cves": []}),
+        );
+        metrics.insert("head_sha".into(), json!("abc123"));
+        metrics.insert("security_context_version".into(), json!("test-version"));
+        metrics.insert("verification_status".into(), json!("ok"));
+        metrics.insert("scan_state".into(), json!("complete"));
+        report["scanner_runs"] = json!([{
+            "tool": "github-sbom-osv", "status": "ok", "detail": "status=fetched"
+        }]);
+        report
+    }
+
+    #[test]
+    fn finalize_rescoring_scores_the_evidence_the_fast_pass_never_saw() {
+        let mut report = fast_pass_report("owner/repo");
+
+        // Baseline: the production shape — four of eight pillars inapplicable.
+        assert_eq!(report["evidence_coverage"], json!(0.47));
+        assert_eq!(report["confidence"], json!("low"));
+        assert_eq!(
+            report["pillar_scores"]["openssf_scorecard"]["applicable"],
+            json!(false)
+        );
+
+        let outputs = HashMap::from([(
+            "scorecard".to_string(),
+            json!({"score": 8.5, "date": "2026-08-18", "checks": []}),
+        )]);
+        rescore_finalized_report(
+            &mut report,
+            "owner/repo",
+            outputs,
+            vec![ScannerRun {
+                tool: "scorecard".into(),
+                status: ScannerStatus::Ok,
+                detail: "Scorecard score: 8.5/10".into(),
+                impact: None,
+            }],
+        );
+
+        assert_eq!(
+            report["pillar_scores"]["openssf_scorecard"]["applicable"],
+            json!(true)
+        );
+        assert_eq!(report["evidence_coverage"], json!(0.72));
+        assert_eq!(report["confidence"], json!("medium"));
+        assert_eq!(report["trust_decision"]["confidence"], json!("medium"));
+        assert_eq!(
+            report["observed_metrics"]["confidence"],
+            json!("medium"),
+            "observed_metrics must track the re-evaluated decision"
+        );
+    }
+
+    #[test]
+    fn finalize_rescoring_preserves_every_progressive_enrichment_key() {
+        let mut report = fast_pass_report("owner/repo");
+        let intel = report["observed_metrics"]["security_intel"].clone();
+
+        rescore_finalized_report(&mut report, "owner/repo", HashMap::new(), vec![]);
+
+        let metrics = &report["observed_metrics"];
+        assert_eq!(metrics["security_intel"], intel);
+        assert_eq!(metrics["head_sha"], json!("abc123"));
+        assert_eq!(metrics["security_context_version"], json!("test-version"));
+        assert_eq!(metrics["verification_status"], json!("ok"));
+        assert_eq!(metrics["scan_state"], json!("complete"));
+        assert_eq!(metrics["repo_metadata"]["full_name"], json!("owner/repo"));
+        assert_eq!(metrics["metadata"]["default_branch"], json!("main"));
+        assert!(metrics.get("owner_metadata").is_some());
+    }
+
+    #[test]
+    fn finalize_rescoring_drops_stale_scored_fields_instead_of_stranding_them() {
+        let mut report = fast_pass_report("owner/repo");
+        // Serialization skips these when empty, so a "copy present keys" merge
+        // would leave the empty-evidence values behind forever.
+        report["missing_evidence"] = json!(["OpenSSF Scorecard: stale gap"]);
+        report["critical_flags"] =
+            json!([{"category": "stale", "severity": "critical", "message": "stale"}]);
+
+        let outputs =
+            HashMap::from([("scorecard".to_string(), json!({"score": 9.0, "checks": []}))]);
+        rescore_finalized_report(&mut report, "owner/repo", outputs, vec![]);
+
+        assert!(
+            !report["missing_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("OpenSSF Scorecard: stale gap")),
+            "stale evidence gaps must not survive re-evaluation"
+        );
+        assert_eq!(report["critical_flags"], json!([]));
+    }
+
+    #[test]
+    fn finalize_rescoring_keeps_existing_scores_without_metadata() {
+        let mut report = fast_pass_report("owner/repo");
+        report["observed_metrics"]["metadata"] = json!(null);
+        report["observed_metrics"]["repo_metadata"] = json!(null);
+        let before = report.clone();
+
+        rescore_finalized_report(&mut report, "owner/repo", HashMap::new(), vec![]);
+
+        assert_eq!(report, before);
+    }
+
+    #[test]
+    fn finalize_keeps_scanner_runs_that_do_not_rerun() {
+        let report = json!({"scanner_runs": [
+            {"tool": "github-sbom-osv", "status": "ok", "detail": "status=fetched"},
+            {"tool": "scorecard", "status": "unavailable", "detail": "stale"}
+        ]});
+
+        let merged = merged_scanner_runs(
+            &report,
+            vec![ScannerRun {
+                tool: "scorecard".into(),
+                status: ScannerStatus::Ok,
+                detail: "Scorecard score: 8.5/10".into(),
+                impact: None,
+            }],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].tool, "scorecard");
+        assert_eq!(merged[0].status, ScannerStatus::Ok);
+        assert_eq!(merged[1].tool, "github-sbom-osv");
+    }
+
+    #[test]
+    fn owner_metadata_reaches_the_nested_owner_object_the_pillars_read() {
+        let mut metadata = cached_metadata("owner/repo");
+        merge_owner_into_metadata(
+            &mut metadata,
+            &json!({
+                "created_at": "2015-01-01T00:00:00Z",
+                "followers": 900,
+                "public_repos": 42,
+                "html_url": "https://github.com/owner"
+            }),
+        );
+
+        assert_eq!(
+            metadata["owner"]["created_at"],
+            json!("2015-01-01T00:00:00Z")
+        );
+        assert_eq!(metadata["owner"]["public_repos"], json!(42));
+        assert_eq!(metadata["owner_details"]["followers"], json!(900));
+    }
+
+    #[tokio::test]
+    async fn progressive_finalize_fetches_owner_metadata_and_rescores() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        seed_metadata_cache(&db, "owner/repo");
+        let service = Service::with_config(
+            db.clone(),
+            None,
+            IntelligenceClientConfig::default(),
+            ServiceConfig {
+                // Keep the test hermetic: no scanner subprocesses, no clones.
+                scanner_enabled: false,
+                ..ServiceConfig::default()
+            },
+        )
+        .with_scanner_checkout_config(ScannerCheckoutConfig {
+            enabled: false,
+            ..ScannerCheckoutConfig::default()
+        });
+        service.owner_cache.write().await.insert(
+            "owner".to_string(),
+            (
+                Instant::now(),
+                json!({
+                    "login": "owner",
+                    "created_at": "2015-01-01T00:00:00Z",
+                    "followers": 900,
+                    "public_repos": 42,
+                    "html_url": "https://github.com/owner"
+                }),
+            ),
+        );
+
+        let (job_id, fast_report) = service.run_progressive_scan("owner/repo").await.unwrap();
+        assert_eq!(fast_report["observed_metrics"]["owner_metadata"], json!({}));
+        assert_eq!(fast_report["observed_metrics"]["scan_state"], "fast_ready");
+
+        complete_progressive_evidence(&db, job_id);
+        assert!(service.try_finalize_progressive(job_id).await.unwrap());
+
+        let finalized = db.get_report("owner/repo").unwrap();
+        let metrics = &finalized["observed_metrics"];
+        assert_eq!(metrics["owner_metadata"]["public_repos"], json!(42));
+        assert_eq!(
+            metrics["metadata"]["owner"]["created_at"],
+            json!("2015-01-01T00:00:00Z"),
+            "publisher pillars read metadata.owner.created_at"
+        );
+        assert_eq!(metrics["scan_state"], json!("complete"));
+        assert_eq!(metrics["verification_status"], json!("ok"));
+        assert!(finalized["evidence_anchored_score"].is_number());
+        assert!(
+            !finalized["pillar_scores"]["publisher_credibility"]["concerns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .is_some_and(|text| text.contains("creation timestamp unavailable"))),
+            "publisher credibility must no longer report missing owner metadata"
+        );
+    }
+
+    /// Drive the progressive evidence queue to the state finalize waits for.
+    fn complete_progressive_evidence(db: &Database, job_id: i64) {
+        let history = db
+            .claim_next_evidence_task("github_history_page", 60)
+            .unwrap()
+            .unwrap();
+        db.complete_evidence_task(
+            history["id"].as_i64().unwrap(),
+            history["attempts"].as_i64().unwrap(),
+            // Digit-free fake SHA on purpose: scripts/security_independence_guard.sh
+            // rejects a repository slug sharing a line with a commit metric and a
+            // multi-digit number, to stop repo-specific results being hardcoded.
+            &json!({"repo": "owner/repo", "page": 1, "count": 1, "commits": [{"sha": "abcdef"}]}),
+        )
+        .unwrap();
+        let nvd = db.claim_next_evidence_task("nvd", 60).unwrap().unwrap();
+        db.complete_evidence_task(
+            nvd["id"].as_i64().unwrap(),
+            nvd["attempts"].as_i64().unwrap(),
+            &json!({"repo": "owner/repo", "count": 0, "cves": []}),
+        )
+        .unwrap();
+        db.enqueue_evidence_task(job_id, "commit_detail_manifest", "candidates", 15)
+            .unwrap();
+        let manifest = db
+            .claim_evidence_task_for_job(job_id, "commit_detail_manifest", 60)
+            .unwrap()
+            .unwrap();
+        db.complete_evidence_task(
+            manifest["id"].as_i64().unwrap(),
+            manifest["attempts"].as_i64().unwrap(),
+            &json!({"repo": "owner/repo", "shas": []}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn evidence_anchored_score_is_published_next_to_the_frozen_score() {
+        let mut pillars = HashMap::new();
+        pillars.insert(
+            "publisher_credibility".to_string(),
+            PillarResult::new("publisher_credibility", "Publisher Credibility")
+                .with_score(20.0, 20.0),
+        );
+        pillars.insert(
+            "openssf_scorecard".to_string(),
+            PillarResult::new("openssf_scorecard", "OpenSSF Scorecard")
+                .with_score(0.0, 25.0)
+                .with_applicable(false)
+                .with_unavailable(vec!["Scorecard data not available.".into()]),
+        );
+
+        let mut result = EvaluationResult::new(
+            "owner/repo",
+            NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            100.0,
+            Grade::A,
+            "Approved",
+            "Use",
+            NaiveDate::from_ymd_opt(2026, 11, 16).unwrap(),
+            pillars,
+            vec![],
+            vec![],
+        );
+        apply_evidence_aware_decision(&mut result);
+        let report = report_json_from_result(&result).unwrap();
+
+        // The frozen contract is untouched...
+        assert_eq!(report["trust_score"], json!(100.0));
+        // ...while the anchored score refuses to award unmeasured evidence.
+        assert_eq!(report["evidence_anchored_score"], json!(20.0));
+        assert_eq!(
+            report["trust_decision"]["evidence_anchored_score"],
+            json!(20.0)
+        );
+        assert_eq!(
+            report["observed_metrics"]["evidence_anchored_score"],
+            json!(20.0)
         );
     }
 

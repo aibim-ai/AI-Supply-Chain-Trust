@@ -13,6 +13,9 @@ scan_paths=(
 exclude_globs=(
   --glob '!backend/target/**'
   --glob '!target/**'
+  # Never committed and absent from the CI checkout, so scanning it only
+  # produces false positives from minified vendor bundles on developer machines.
+  --glob '!**/node_modules/**'
   --glob '!frontend/web/**'
   --glob '!frontend/coverage/**'
   --glob '!**/*.png'

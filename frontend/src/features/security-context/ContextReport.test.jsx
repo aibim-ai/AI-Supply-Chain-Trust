@@ -171,6 +171,49 @@ describe("ContextReport", () => {
     expect(html).not.toContain("Guard parser");
   });
 
+  it("separates scanned commits, flagged commits and policy findings", () => {
+    const html = renderToStaticMarkup(
+      <ContextReport
+        repository="example/repo"
+        payload={{
+          ...payload,
+          context: {
+            ...payload.context,
+            commits_scanned: 1000,
+            commits_flagged: 3,
+            policy_flags: 2,
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain("1,000 scanned");
+    expect(html).toContain("3 flagged");
+    expect(html).toContain("Policy findings");
+  });
+
+  it("omits the flagged commit count when nothing was flagged", () => {
+    // Previously this row showed the policy-finding count, which produced
+    // impossible output such as "1 commit scanned, 2 commits flagged".
+    const html = renderToStaticMarkup(
+      <ContextReport
+        repository="example/repo"
+        payload={{
+          ...payload,
+          context: {
+            ...payload.context,
+            commits_scanned: 1,
+            commits_flagged: 0,
+            policy_flags: 2,
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain("1 scanned");
+    expect(html).not.toContain("flagged");
+  });
+
   it("collapses long regression watchlists after the first eight contracts", () => {
     const contracts = Array.from({ length: 10 }, (_, index) => ({
       ...payload.context.watchlist[0],

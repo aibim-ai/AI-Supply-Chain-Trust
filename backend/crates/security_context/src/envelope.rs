@@ -74,8 +74,13 @@ pub fn envelope_from_report(report: &Value, repo: &str, base_url: &str) -> Secur
         .unwrap_or("")
         .to_string();
 
-    let top_sev =
-        super::top_risks::top_severity_from(context.get("fingerprints").unwrap_or(&json!([])));
+    // Headline severity must consider known CVEs, not just fix-commit
+    // fingerprints — a repo can have zero fix commits and 24 rated CVEs.
+    let empty = json!([]);
+    let top_sev = super::top_risks::top_severity_from_parts(
+        context.get("fingerprints").unwrap_or(&empty),
+        context.get("known_cves").unwrap_or(&empty),
+    );
 
     let coverage = context
         .get("remediation")
@@ -166,7 +171,7 @@ fn make_empty_context(owner: &str, name: &str) -> SecurityContext {
             "ref": "unknown", "head_sha": "unknown"
         },
         "generated_at": "",
-        "commits_scanned": 0, "commits_flagged": 0,
+        "commits_scanned": 0, "commits_flagged": 0, "policy_flags": 0,
         "archetype": "repository", "excluded_availability": 0,
         "summary": "No verified evidence available.",
         "agent_brief": "",

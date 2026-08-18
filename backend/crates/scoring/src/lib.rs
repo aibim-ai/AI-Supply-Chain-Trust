@@ -63,6 +63,57 @@ pub fn composite_score(pillars: &HashMap<String, PillarResult>) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Evidence-Anchored Score (additive — NOT part of the frozen contract)
+// ---------------------------------------------------------------------------
+/// Total of every weight in `PILLAR_WEIGHTS` (100.0 by contract).
+fn total_pillar_weight() -> f64 {
+    PILLAR_WEIGHTS.iter().map(|(_, w)| *w).sum()
+}
+
+/// Computes the **evidence-anchored** trust score: the share of the *entire*
+/// 100-point pillar model that was actually earned.
+///
+/// Formula: `sum(pillar.normalized * weight) / TOTAL_WEIGHT`, clamped to
+/// `[0, 100]`, where `TOTAL_WEIGHT` is the sum of **all** `PILLAR_WEIGHTS`
+/// (100.0). Inapplicable pillars — and pillars absent from the map entirely —
+/// contribute `0` to the numerator, but their weight still counts in the
+/// denominator.
+///
+/// # How this differs from [`composite_score`]
+/// [`composite_score`] (frozen contract) skips inapplicable pillars on *both*
+/// sides of the division, so it answers "of the evidence we managed to gather,
+/// what fraction was good?". When 4 of 8 pillars are inapplicable — 53 of the
+/// 100 available weight — a repo can score 100.0/grade A while only 47% of the
+/// model was ever measured, which is why such reports pair a perfect score with
+/// an `evidence_coverage` of 0.47 and a verdict of "Insufficient evidence for
+/// approval".
+///
+/// `evidence_anchored_score` instead answers "how much of the full trust model
+/// did this repository actually demonstrate?" — unmeasured evidence never earns
+/// points. Under the production shape above, a repo perfect on all four
+/// applicable pillars scores 47.0 here versus 100.0 from [`composite_score`].
+///
+/// This function is additive: [`composite_score`] and the grading it feeds are
+/// unchanged. Use this as a reporting/telemetry view alongside the frozen score,
+/// not as a replacement for it.
+pub fn evidence_anchored_score(pillars: &HashMap<String, PillarResult>) -> f64 {
+    let total_weight = total_pillar_weight();
+    if total_weight <= 0.0 {
+        return 0.0;
+    }
+
+    let mut total_weighted = 0.0_f64;
+    for (key, pillar) in pillars {
+        if !pillar.applicable {
+            continue;
+        }
+        total_weighted += pillar.normalized_score * pillar_weight(key);
+    }
+
+    (total_weighted / total_weight).clamp(0.0, 100.0)
+}
+
+// ---------------------------------------------------------------------------
 // Grade (Python: scoring.grade_for_score)
 // ---------------------------------------------------------------------------
 /// Returns `(grade, verdict, action, override_applied)`.
@@ -115,6 +166,78 @@ mod tests {
             .map(|(k, _)| (k.to_string(), pillar(k, 0.0)))
             .collect();
         assert_eq!(composite_score(&pillars), 0.0);
+    }
+
+    fn inapplicable(key: &str) -> PillarResult {
+        let mut p = pillar(key, 0.0);
+        p.applicable = false;
+        p
+    }
+
+    #[test]
+    fn evidence_anchored_all_applicable_perfect_is_100() {
+        let pillars: HashMap<String, PillarResult> = PILLAR_WEIGHTS
+            .iter()
+            .map(|(k, _)| (k.to_string(), pillar(k, 100.0)))
+            .collect();
+        assert!((evidence_anchored_score(&pillars) - 100.0).abs() < 0.01);
+    }
+
+    /// The real production shape: only four pillars are applicable (47 of the
+    /// 100 weight). Perfect on all of them = 47.0 evidence-anchored, while
+    /// `composite_score` reports 100.0.
+    #[test]
+    fn evidence_anchored_production_shape_is_47() {
+        let applicable_keys = [
+            "publisher_credibility",
+            "repo_health",
+            "supply_chain_attack_prediction",
+            "publisher_identity_graph",
+        ];
+        let pillars: HashMap<String, PillarResult> = PILLAR_WEIGHTS
+            .iter()
+            .map(|(k, _)| {
+                if applicable_keys.contains(k) {
+                    (k.to_string(), pillar(k, 100.0))
+                } else {
+                    (k.to_string(), inapplicable(k))
+                }
+            })
+            .collect();
+
+        assert!(
+            (evidence_anchored_score(&pillars) - 47.0).abs() < 0.01,
+            "got {}",
+            evidence_anchored_score(&pillars)
+        );
+        // The frozen composite is untouched and still reports 100.
+        assert!((composite_score(&pillars) - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn evidence_anchored_all_inapplicable_is_zero() {
+        let pillars: HashMap<String, PillarResult> = PILLAR_WEIGHTS
+            .iter()
+            .map(|(k, _)| (k.to_string(), inapplicable(k)))
+            .collect();
+        assert_eq!(evidence_anchored_score(&pillars), 0.0);
+    }
+
+    #[test]
+    fn evidence_anchored_empty_map_is_zero() {
+        let pillars: HashMap<String, PillarResult> = HashMap::new();
+        assert_eq!(evidence_anchored_score(&pillars), 0.0);
+    }
+
+    #[test]
+    fn evidence_anchored_never_exceeds_composite() {
+        let pillars: HashMap<String, PillarResult> = PILLAR_WEIGHTS
+            .iter()
+            .map(|(k, _)| (k.to_string(), pillar(k, 60.0)))
+            .collect();
+        let anchored = evidence_anchored_score(&pillars);
+        assert!((anchored - 60.0).abs() < 0.01);
+        assert!(anchored <= composite_score(&pillars) + 0.01);
     }
 
     #[test]

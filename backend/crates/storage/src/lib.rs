@@ -70,6 +70,60 @@ fn report_context_summary(report: &Value) -> (usize, usize, &'static str) {
     (fixes, cves, status)
 }
 
+/// Resolves the most recent *usable* evaluation per repository entirely in SQL.
+///
+/// `clean` drops rows whose stored report carries a critical security-intel
+/// error (the SQL mirror of [`report_has_critical_intel_errors`]; the `GLOB`
+/// patterns are case sensitive exactly like `str::starts_with`). `latest` then
+/// keeps one row per repository — the newest row that survived that filter, so
+/// a repository whose newest evaluation is unusable still surfaces through its
+/// most recent good one, which is what the Rust-side filter used to do.
+///
+/// Callers append `SELECT ... ORDER BY ... LIMIT ?1`, so the limit applies to
+/// *distinct repositories* rather than to a fixed window of evaluation rows,
+/// and only the returned reports are deserialized.
+const LATEST_CLEAN_EVALUATIONS_CTE: &str = r#"
+WITH clean AS (
+    SELECT
+        id,
+        trust_score,
+        COALESCE(json_extract(report_json, '$.repo'), repo) AS repo_key,
+        report_json
+    FROM evaluations
+    WHERE json_valid(report_json)
+      AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(
+                CASE WHEN json_valid(evaluations.report_json)
+                     THEN json_extract(
+                              evaluations.report_json,
+                              '$.observed_metrics.security_intel.errors')
+                END) AS intel_error
+            WHERE intel_error.value GLOB 'advisories:*'
+               OR intel_error.value GLOB 'commits:*'
+               OR intel_error.value GLOB 'repo_meta:*')
+),
+latest AS (
+    SELECT repo_key, MAX(id) AS id FROM clean GROUP BY repo_key
+)
+"#;
+
+/// A repository is policy blocked when the evaluator raised critical flags.
+/// `crates/service` derives all three published spellings of that one fact
+/// together (`critical_flags` non-empty => `confidence = "policy_block"` and
+/// `trust_decision.policy_block = true`), so the published decision fields are
+/// authoritative here; `critical_flags_json` is only consulted as a fallback
+/// for rows stored before `trust_decision` existed.
+const POLICY_BLOCKED_PREDICATE: &str = r#"
+       (CASE WHEN json_valid(evaluations.report_json)
+             THEN json_extract(evaluations.report_json, '$.trust_decision.policy_block') IN (1, 'true')
+                  OR json_extract(evaluations.report_json, '$.confidence') = 'policy_block'
+             ELSE 0 END)
+    OR (CASE WHEN json_valid(evaluations.critical_flags_json)
+             THEN json_array_length(evaluations.critical_flags_json)
+             ELSE 0 END) > 0
+"#;
+
 fn report_has_critical_intel_errors(report: &Value) -> bool {
     report
         .get("observed_metrics")
@@ -2407,16 +2461,63 @@ impl Database {
         Ok(())
     }
 
-    pub fn latest_reports(&self, limit: i64) -> Result<Vec<Value>, anyhow::Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT report_json FROM evaluations ORDER BY id DESC LIMIT 1000")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut seen = std::collections::BTreeSet::new();
-        let mut reports = rows
-            .filter_map(|row| row.ok())
+    /// Deserialized reports for the newest usable evaluation of each
+    /// repository, ordered by `order_by` and capped at `limit` repositories.
+    ///
+    /// Returns `None` (rather than an empty list) when the query cannot run, so
+    /// callers can fall back to the legacy row-window scan instead of silently
+    /// publishing an empty inventory.
+    fn latest_clean_reports(&self, order_by: &str, limit: i64) -> Option<Vec<Value>> {
+        let sql = format!(
+            "{LATEST_CLEAN_EVALUATIONS_CTE}
+             SELECT clean.report_json
+             FROM clean JOIN latest ON latest.id = clean.id
+             ORDER BY {order_by}
+             LIMIT ?1"
+        );
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| tracing::warn!(%error, "latest-per-repository query unavailable"))
+            .ok()?;
+        let rows = stmt
+            .query_map(params![limit], |row| row.get::<_, String>(0))
+            .map_err(|error| tracing::warn!(%error, "latest-per-repository query failed"))
+            .ok()?;
+        Some(
+            rows.filter_map(|row| row.ok())
+                .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .collect(),
+        )
+    }
+
+    /// Legacy fallback: the newest 1000 evaluation rows, newest first, with
+    /// unusable reports dropped. Only used when [`Self::latest_clean_reports`]
+    /// cannot run.
+    fn recent_report_window(&self) -> Vec<Value> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT report_json FROM evaluations ORDER BY id DESC LIMIT 1000")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(|row| row.ok())
             .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
             .filter(|report| !report_has_critical_intel_errors(report))
+            .collect()
+    }
+
+    pub fn latest_reports(&self, limit: i64) -> Result<Vec<Value>, anyhow::Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut reports = self
+            .latest_clean_reports("clean.trust_score DESC, clean.id DESC", limit)
+            .unwrap_or_else(|| self.recent_report_window())
+            .into_iter()
             .filter_map(|report| {
                 let repo = report.get("repo").and_then(Value::as_str)?.to_string();
                 if !seen.insert(repo.clone()) {
@@ -2509,20 +2610,17 @@ impl Database {
             .find(|report| !report_has_critical_intel_errors(report))
     }
 
+    /// The newest usable evaluation of each repository, newest first.
+    ///
+    /// `limit` counts *repositories*: the sitemap and the stale-rescan sweep
+    /// both walk this list, so a fixed window over evaluation rows would make
+    /// both shrink as rescans accumulate.
     pub fn recent_scans(&self, limit: i64) -> Vec<Value> {
-        let conn = self.conn.lock().unwrap();
-        let stmt = conn
-            .prepare("SELECT report_json FROM evaluations ORDER BY id DESC LIMIT 1000")
-            .ok();
-        let Some(mut stmt) = stmt else { return vec![] };
         let mut seen = std::collections::BTreeSet::new();
-        stmt.query_map([], |row| row.get::<_, String>(0))
-        .ok()
-        .into_iter()
-        .flat_map(|rows| rows.filter_map(|r| r.ok()))
-        .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .filter(|report| !report_has_critical_intel_errors(report))
-        .filter_map(|report| {
+        self.latest_clean_reports("clean.id DESC", limit)
+            .unwrap_or_else(|| self.recent_report_window())
+            .into_iter()
+            .filter_map(|report| {
             let repo = report.get("repo").and_then(Value::as_str)?.to_string();
             if !seen.insert(repo.clone()) {
                 return None;
@@ -2564,12 +2662,49 @@ impl Database {
         } else {
             rows.iter().collect()
         };
+        // `count` stays what it always was: how many rows this response
+        // carries. `metrics` describes the whole tracked inventory, so it does
+        // not move when a caller narrows the query or lowers the limit.
         let count = filtered.len() as i64;
         json!({
             "count": count,
             "rows": filtered.into_iter().take(limit as usize).cloned().collect::<Vec<_>>(),
-            "metrics": {"tracked_repos": count, "critical_blocks": 0}
+            "metrics": {
+                "tracked_repos": self.tracked_repository_count(),
+                "critical_blocks": self.policy_blocked_repository_count()
+            }
         })
+    }
+
+    /// Every repository with at least one stored evaluation. Matches
+    /// `unique_repos` in [`Self::metrics`].
+    pub fn tracked_repository_count(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        conn.query_row("SELECT COUNT(DISTINCT repo) FROM evaluations", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0)
+    }
+
+    /// Repositories whose *latest* evaluation is policy blocked.
+    pub fn policy_blocked_repository_count(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (
+                     SELECT MAX(id) AS id FROM evaluations GROUP BY repo
+                 ) AS latest
+                 JOIN evaluations ON evaluations.id = latest.id
+                 WHERE {POLICY_BLOCKED_PREDICATE}"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
     }
 
     pub fn publish_trust_event(
@@ -3949,6 +4084,147 @@ mod tests {
         assert_eq!(recent[0]["verdict"], json!("Previous"));
         assert_eq!(recent[0]["fixes"], json!(1));
         assert_eq!(latest[0]["verdict"], json!("Previous"));
+    }
+
+    fn stored_report(repo: &str, score: f64, critical_flags: Value) -> Value {
+        let blocked = critical_flags
+            .as_array()
+            .map(|flags| !flags.is_empty())
+            .unwrap_or(false);
+        json!({
+            "repo": repo,
+            "evaluated_at": "2026-07-14",
+            "trust_score": score,
+            "grade": if blocked { "F" } else { "B" },
+            "verdict": if blocked { "Blocked by policy" } else { "Review" },
+            "action": "Review",
+            "next_review_date": "2026-10-12",
+            "coverage": "3/7",
+            "confidence": if blocked { "policy_block" } else { "high" },
+            "trust_decision": {"policy_block": blocked},
+            "critical_flags": critical_flags,
+            "pillar_scores": {},
+            "scanner_runs": [],
+            "observed_metrics": {},
+            "scoring_version": "v1"
+        })
+    }
+
+    /// Rescans must never crowd repositories out of the listing: the limit
+    /// counts repositories, not evaluation rows.
+    #[test]
+    fn recent_scans_limit_counts_repositories_not_evaluation_rows() {
+        let db = Database::open_memory().unwrap();
+        for index in 0..40 {
+            db.insert_report(&stored_report(
+                &format!("owner/repo-{index}"),
+                70.0,
+                json!([]),
+            ))
+            .unwrap();
+        }
+        // One noisy repository is rescanned far more often than every other
+        // repository combined.
+        for round in 0..2000 {
+            db.insert_report(&stored_report(
+                "owner/noisy",
+                50.0 + (round % 10) as f64,
+                json!([]),
+            ))
+            .unwrap();
+        }
+
+        let rows = db.recent_scans(40);
+        let repos = rows
+            .iter()
+            .filter_map(|row| row["repo"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(rows.len(), 40, "limit must be honoured per repository");
+        assert_eq!(repos.len(), 40, "rows must be one per repository");
+        assert_eq!(rows[0]["repo"], json!("owner/noisy"), "newest first");
+
+        // Every tracked repository is reachable, which is what the sitemap and
+        // the stale-rescan sweep both depend on — including the repository
+        // whose only evaluation is 2000 rescans old.
+        let all = db.recent_scans(1000);
+        assert_eq!(all.len(), 41);
+        assert!(all.iter().any(|row| row["repo"] == json!("owner/repo-0")));
+    }
+
+    #[test]
+    fn leaderboard_metrics_describe_the_whole_inventory() {
+        let db = Database::open_memory().unwrap();
+        for index in 0..12 {
+            db.insert_report(&stored_report(
+                &format!("owner/clean-{index}"),
+                90.0 - index as f64,
+                json!([]),
+            ))
+            .unwrap();
+        }
+        for index in 0..3 {
+            db.insert_report(&stored_report(
+                &format!("owner/blocked-{index}"),
+                10.0,
+                json!([{"code": "unmaintained_dependency", "severity": "critical"}]),
+            ))
+            .unwrap();
+        }
+        // A repository that *was* blocked and has since been cleared counts as
+        // clean, because only the latest evaluation decides.
+        db.insert_report(&stored_report(
+            "owner/recovered",
+            20.0,
+            json!([{"code": "missing_license", "severity": "critical"}]),
+        ))
+        .unwrap();
+        db.insert_report(&stored_report("owner/recovered", 80.0, json!([])))
+            .unwrap();
+
+        let board = db.leaderboard(None, 5);
+
+        assert_eq!(board["count"], json!(5), "count is the returned row count");
+        assert_eq!(board["rows"].as_array().unwrap().len(), 5);
+        assert_eq!(board["metrics"]["tracked_repos"], json!(16));
+        assert_eq!(board["metrics"]["critical_blocks"], json!(3));
+        assert_eq!(
+            board["metrics"]["tracked_repos"],
+            db.metrics()["unique_repos"],
+            "leaderboard inventory must agree with /metrics"
+        );
+
+        // Narrowing the query narrows `count` but never the inventory metrics.
+        let filtered = db.leaderboard(Some("blocked"), 50);
+        assert_eq!(filtered["count"], json!(3));
+        assert_eq!(filtered["metrics"]["tracked_repos"], json!(16));
+        assert_eq!(filtered["metrics"]["critical_blocks"], json!(3));
+    }
+
+    /// Reports predating `trust_decision` only carry `critical_flags`.
+    #[test]
+    fn policy_blocks_count_legacy_reports_without_trust_decision() {
+        let db = Database::open_memory().unwrap();
+        db.insert_report(&json!({
+            "repo": "legacy/blocked", "evaluated_at": "2026-01-01", "trust_score": 12.0,
+            "grade": "F", "verdict": "Blocked", "action": "Hold", "next_review_date": "2026-04-01",
+            "coverage": "2/7",
+            "critical_flags": [{"code": "typosquat", "severity": "critical"}],
+            "pillar_scores": {}, "scanner_runs": [], "observed_metrics": {},
+            "scoring_version": "v0"
+        }))
+        .unwrap();
+        db.insert_report(&json!({
+            "repo": "legacy/clean", "evaluated_at": "2026-01-01", "trust_score": 82.0,
+            "grade": "A", "verdict": "Use", "action": "Use", "next_review_date": "2026-04-01",
+            "coverage": "6/7", "critical_flags": [],
+            "pillar_scores": {}, "scanner_runs": [], "observed_metrics": {},
+            "scoring_version": "v0"
+        }))
+        .unwrap();
+
+        assert_eq!(db.policy_blocked_repository_count(), 1);
+        assert_eq!(db.tracked_repository_count(), 2);
     }
 
     #[test]

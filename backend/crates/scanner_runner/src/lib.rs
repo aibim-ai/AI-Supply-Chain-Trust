@@ -2,8 +2,7 @@
 //! Executes external CLI security scanners and captures JSON output.
 
 use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -45,8 +44,21 @@ impl ScannerTool {
         }
     }
 
+    /// The executable actually invoked for this tool. This is *not* always the
+    /// tool name: `npm-audit` is a subcommand of the `npm` binary, and probing
+    /// PATH for a non-existent `npm-audit` executable would report the tool as
+    /// missing even on an image that ships Node.
     pub fn binary(&self) -> &'static str {
-        self.name()
+        match self {
+            ScannerTool::NpmAudit => "npm",
+            _ => self.name(),
+        }
+    }
+
+    /// Whether the tool needs a local checkout of the repository. Tools that
+    /// query the remote repository directly (Scorecard) do not.
+    pub fn requires_source(&self) -> bool {
+        !matches!(self, ScannerTool::Scorecard)
     }
 
     pub fn timeout_seconds(&self) -> u64 {
@@ -56,6 +68,29 @@ impl ScannerTool {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scanner outcome states
+// ---------------------------------------------------------------------------
+// These are deliberately finer-grained than the persisted `ScannerStatus`
+// variants, because "we never installed the tool", "we never checked out the
+// source" and "this manifest does not exist in this repository" are three
+// different facts about a scan and only the last one is a property of the
+// repository being scanned. Collapsing them into a single "data not available"
+// sentence hides deployment gaps from operators and mislabels them as findings
+// about the repository.
+
+/// The tool ran and produced output.
+pub const STATUS_OK: &str = "ok";
+/// The tool's binary is not present in this deployment image (a deployment gap).
+pub const STATUS_NOT_INSTALLED: &str = "not_installed";
+/// The tool needs a local checkout and none was provided (a deployment gap).
+pub const STATUS_NO_SOURCE: &str = "no_source";
+/// The tool ran against a checkout but the ecosystem it audits is absent from
+/// this repository (a genuine property of the repository).
+pub const STATUS_NOT_APPLICABLE: &str = "not_applicable";
+/// The tool was invoked and errored or timed out.
+pub const STATUS_FAILED: &str = "failed";
 
 // ---------------------------------------------------------------------------
 // Scanner result
@@ -101,10 +136,16 @@ impl ScannerRunner {
         let mut results = Vec::new();
         for tool in ScannerTool::all() {
             if !is_tool_available(tool.binary()) {
+                // A missing binary wins over a missing checkout: it is the
+                // earlier and more specific fact about why nothing ran.
+                results.push(not_installed_result(tool));
+                continue;
+            }
+            if tool.requires_source() && self.available_source().is_none() {
                 results.push(ScannerResult {
                     tool: tool.name().into(),
-                    status: "unavailable".into(),
-                    detail: format!("{} binary not found in PATH", tool.binary()),
+                    status: STATUS_NO_SOURCE.into(),
+                    detail: self.missing_source_detail(tool),
                     output: None,
                     duration_ms: 0,
                 });
@@ -113,6 +154,26 @@ impl ScannerRunner {
             results.push(self.run_one(tool).await);
         }
         results
+    }
+
+    /// Explain *why* no checkout was available: never requested, or requested
+    /// and unusable. Operators need to tell a disabled feature apart from a
+    /// broken clone.
+    fn missing_source_detail(&self, tool: ScannerTool) -> String {
+        match self.source_path.as_deref() {
+            None => format!(
+                "{} was not run: it needs a local checkout of the repository and none was \
+                 provided (source checkout is disabled for this deployment). This is a scanner \
+                 deployment gap, not a finding about the repository.",
+                tool.name()
+            ),
+            Some(path) => format!(
+                "{} was not run: the configured source checkout '{path}' does not exist or is \
+                 not readable. This is a scanner deployment gap, not a finding about the \
+                 repository.",
+                tool.name()
+            ),
+        }
     }
 
     pub async fn run_one(&self, tool: ScannerTool) -> ScannerResult {
@@ -135,7 +196,7 @@ impl ScannerRunner {
         })
         .unwrap_or_else(|e| ScannerResult {
             tool: tool.name().into(),
-            status: "failed".into(),
+            status: STATUS_FAILED.into(),
             detail: e.to_string(),
             output: None,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -161,7 +222,7 @@ impl ScannerRunner {
         let json: Value = serde_json::from_str(&output)?;
         let score = json.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("Scorecard score: {score:.1}/10"),
             Some(json),
         ))
@@ -173,8 +234,8 @@ impl ScannerRunner {
     async fn run_gitleaks(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available for gitleaks".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::Gitleaks),
                 None,
             ));
         };
@@ -186,12 +247,16 @@ impl ScannerRunner {
         )
         .await?;
         if output.trim().is_empty() {
-            return Ok(("ok".into(), "No secrets found".into(), Some(json!([]))));
+            return Ok((
+                STATUS_OK.into(),
+                "Gitleaks: no secrets found".into(),
+                Some(json!([])),
+            ));
         }
         let json: Value = serde_json::from_str(&output)?;
         let count = json.as_array().map(|a| a.len()).unwrap_or(0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("Gitleaks: {count} secrets found"),
             Some(json),
         ))
@@ -203,14 +268,21 @@ impl ScannerRunner {
     async fn run_pip_audit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::PipAudit),
                 None,
             ));
         };
         let req = find_file(&path, &["requirements.txt", "pyproject.toml", "setup.py"]);
         let Some(req) = req else {
-            return Ok(("skipped".into(), "No Python manifest found".into(), None));
+            return Ok((
+                STATUS_NOT_APPLICABLE.into(),
+                format!(
+                    "pip-audit does not apply: no Python manifest (requirements.txt, \
+                     pyproject.toml or setup.py) exists in {path}."
+                ),
+                None,
+            ));
         };
         let output = run_cmd(
             "pip-audit",
@@ -226,7 +298,7 @@ impl ScannerRunner {
             .map(|a| a.len())
             .unwrap_or(0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("pip-audit: {vulns} vulnerabilities"),
             Some(json),
         ))
@@ -238,14 +310,18 @@ impl ScannerRunner {
     async fn run_npm_audit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::NpmAudit),
                 None,
             ));
         };
         let pkg = find_file(&path, &["package.json"]);
         let Some(_pkg) = pkg else {
-            return Ok(("skipped".into(), "No package.json found".into(), None));
+            return Ok((
+                STATUS_NOT_APPLICABLE.into(),
+                format!("npm audit does not apply: no package.json exists in {path}."),
+                None,
+            ));
         };
         let output = run_cmd(
             "npm",
@@ -262,7 +338,7 @@ impl ScannerRunner {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("npm audit: {vulns} vulnerabilities"),
             Some(json),
         ))
@@ -274,8 +350,8 @@ impl ScannerRunner {
     async fn run_semgrep(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::Semgrep),
                 None,
             ));
         };
@@ -293,7 +369,7 @@ impl ScannerRunner {
             .map(|a| a.len())
             .unwrap_or(0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("Semgrep: {findings} findings"),
             Some(json),
         ))
@@ -305,8 +381,8 @@ impl ScannerRunner {
     async fn run_bandit(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::Bandit),
                 None,
             ));
         };
@@ -323,7 +399,11 @@ impl ScannerRunner {
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
-        Ok(("ok".into(), format!("Bandit: {issues} issues"), Some(json)))
+        Ok((
+            STATUS_OK.into(),
+            format!("Bandit: {issues} issues"),
+            Some(json),
+        ))
     }
 
     // -------------------------------------------------------------------
@@ -332,8 +412,8 @@ impl ScannerRunner {
     async fn run_trivy(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
-                "skipped".into(),
-                "No source directory available".into(),
+                STATUS_NO_SOURCE.into(),
+                self.missing_source_detail(ScannerTool::Trivy),
                 None,
             ));
         };
@@ -358,7 +438,7 @@ impl ScannerRunner {
             .map(|a| a.len())
             .unwrap_or(0);
         Ok((
-            "ok".into(),
+            STATUS_OK.into(),
             format!("Trivy: {results} result groups"),
             Some(json),
         ))
@@ -373,6 +453,184 @@ impl ScannerRunner {
             .and_then(|path| std::fs::canonicalize(path).ok())
             .map(|path| path.to_string_lossy().into_owned())
     }
+}
+
+/// The tool's binary is absent from the image, so nothing was attempted. This
+/// is a deployment gap and must never read as evidence about the repository.
+fn not_installed_result(tool: ScannerTool) -> ScannerResult {
+    ScannerResult {
+        tool: tool.name().into(),
+        status: STATUS_NOT_INSTALLED.into(),
+        detail: format!(
+            "{} was not run: the '{}' binary is not installed in this deployment image. \
+             This is a scanner deployment gap, not a finding about the repository.",
+            tool.name(),
+            tool.binary()
+        ),
+        output: None,
+        duration_ms: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source checkout (opt-in)
+// ---------------------------------------------------------------------------
+/// Bounds applied to a repository checkout. Cloning arbitrary public
+/// repositories onto the host has real disk and security implications, so every
+/// bound is explicit and enforced rather than best-effort.
+#[derive(Debug, Clone)]
+pub struct CheckoutOptions {
+    /// Wall-clock limit for the clone.
+    pub timeout_seconds: u64,
+    /// Hard cap on the checkout size; a larger clone is deleted, not scanned.
+    pub max_bytes: u64,
+    /// Parent directory the temporary checkout is created under.
+    pub root: PathBuf,
+}
+
+impl Default for CheckoutOptions {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 120,
+            max_bytes: 1024 * 1024 * 1024,
+            root: std::env::temp_dir(),
+        }
+    }
+}
+
+/// A temporary shallow checkout of a public repository.
+///
+/// The directory is removed when this value is dropped — including on the error
+/// paths below, which construct the guard *before* running `git` so that a
+/// timed-out or oversized clone still cleans up after itself.
+#[derive(Debug)]
+pub struct SourceCheckout {
+    path: PathBuf,
+}
+
+impl SourceCheckout {
+    /// Shallow-clone (`--depth 1`) a public HTTPS repository into a bounded
+    /// temporary directory.
+    pub async fn shallow_clone(
+        repo_url: &str,
+        options: &CheckoutOptions,
+    ) -> anyhow::Result<SourceCheckout> {
+        let url = validated_clone_url(repo_url)?;
+        if !is_tool_available("git") {
+            anyhow::bail!("git binary is not installed in this deployment image");
+        }
+        let path = options.root.join(format!(
+            "ai-supply-chain-trust-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).ok();
+        }
+        std::fs::create_dir_all(&path)?;
+        // Own the directory before the clone so every early return removes it.
+        let checkout = SourceCheckout { path };
+        let destination = checkout.path.to_string_lossy().into_owned();
+
+        run_cmd(
+            "git",
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--no-tags",
+                "--quiet",
+                "--",
+                &url,
+                &destination,
+            ],
+            options.timeout_seconds,
+            &[
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_ASKPASS", "/bin/true"),
+                ("GCM_INTERACTIVE", "never"),
+            ],
+        )
+        .await?;
+
+        let size = directory_size_bytes(&checkout.path, options.max_bytes);
+        if size > options.max_bytes {
+            anyhow::bail!(
+                "checkout of {url} exceeded the {} byte limit",
+                options.max_bytes
+            );
+        }
+        Ok(checkout)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SourceCheckout {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "Failed to remove scanner source checkout"
+                );
+            }
+        }
+    }
+}
+
+/// Accept only plain public HTTPS git URLs. This keeps the clone away from
+/// local paths, `file://`, ssh remotes, and `--upload-pack`-style argument
+/// injection.
+fn validated_clone_url(repo_url: &str) -> anyhow::Result<String> {
+    let url = repo_url.trim();
+    if !url.starts_with("https://") {
+        anyhow::bail!("only https clone URLs are allowed, got {url}");
+    }
+    if url.len() > 512 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("clone URL is malformed");
+    }
+    let rest = &url["https://".len()..];
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.contains('@') || host.is_empty() {
+        anyhow::bail!("clone URL must not carry credentials");
+    }
+    Ok(url.to_string())
+}
+
+/// Sum file sizes under `root`, stopping early once `limit` is exceeded so an
+/// oversized checkout is rejected without walking all of it.
+fn directory_size_bytes(root: &Path, limit: u64) -> u64 {
+    let mut total = 0_u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // symlink_metadata: never follow links out of the checkout, and
+            // never walk a symlink cycle.
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(metadata.len());
+                if total > limit {
+                    return total;
+                }
+            }
+        }
+    }
+    total
 }
 
 // ---------------------------------------------------------------------------
@@ -403,12 +661,35 @@ async fn run_cmd(
     }
 }
 
-fn is_tool_available(binary: &str) -> bool {
-    Command::new("which")
-        .arg(binary)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Whether `binary` resolves to an executable on PATH. Resolved in-process
+/// rather than by spawning `which`, so probing seven tools costs no processes
+/// and cannot be confused by a missing `which`.
+pub fn is_tool_available(binary: &str) -> bool {
+    if binary.contains('/') {
+        return is_executable(Path::new(binary));
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(binary)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn find_file(root: &str, candidates: &[&str]) -> Option<String> {
@@ -443,15 +724,24 @@ mod tests {
     #[test]
     fn scanner_registry_exposes_binary_and_timeout_contracts() {
         for tool in ScannerTool::all() {
-            assert_eq!(tool.binary(), tool.name());
             assert!(matches!(tool.timeout_seconds(), 120 | 300));
         }
+        // npm-audit is the only tool whose executable differs from its name.
+        assert_eq!(ScannerTool::NpmAudit.binary(), "npm");
+        for tool in ScannerTool::all()
+            .into_iter()
+            .filter(|tool| *tool != ScannerTool::NpmAudit)
+        {
+            assert_eq!(tool.binary(), tool.name());
+        }
+        assert!(!ScannerTool::Scorecard.requires_source());
+        assert!(ScannerTool::Gitleaks.requires_source());
         assert_eq!(ScannerTool::Scorecard.timeout_seconds(), 300);
         assert_eq!(ScannerTool::Gitleaks.timeout_seconds(), 120);
     }
 
     #[tokio::test]
-    async fn missing_manifests_and_source_paths_are_skipped_without_processes() {
+    async fn unusable_source_paths_report_a_deployment_gap_not_a_repository_finding() {
         let runner = ScannerRunner::new("https://github.com/owner/repo")
             .with_source("/definitely/missing/ai-supply-chain-trust-source");
 
@@ -461,10 +751,104 @@ mod tests {
             ScannerTool::NpmAudit,
         ] {
             let result = runner.run_one(tool).await;
-            assert_eq!(result.status, "skipped");
+            assert_eq!(result.status, STATUS_NO_SOURCE);
             assert!(result.output.is_none());
-            assert!(!result.detail.is_empty());
+            assert!(
+                result.detail.contains("deployment gap"),
+                "detail must name the deployment gap, got {}",
+                result.detail
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn missing_manifests_are_reported_as_not_applicable_to_the_repository() {
+        let root = std::env::temp_dir().join(format!(
+            "scanner-runner-manifests-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let runner = ScannerRunner::new("https://github.com/owner/repo")
+            .with_source(root.to_string_lossy().to_string());
+
+        for tool in [ScannerTool::PipAudit, ScannerTool::NpmAudit] {
+            let result = runner.run_one(tool).await;
+            assert_eq!(result.status, STATUS_NOT_APPLICABLE);
+            assert!(
+                result.detail.contains("does not apply"),
+                "detail must say the ecosystem is absent, got {}",
+                result.detail
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninstalled_tools_name_the_image_gap_and_the_missing_binary() {
+        let result = not_installed_result(ScannerTool::NpmAudit);
+
+        assert_eq!(result.tool, "npm-audit");
+        assert_eq!(result.status, STATUS_NOT_INSTALLED);
+        assert!(result.detail.contains("'npm' binary is not installed"));
+        assert!(result.detail.contains("not a finding about the repository"));
+        assert!(result.output.is_none());
+    }
+
+    #[test]
+    fn tool_availability_resolves_against_path_without_spawning_processes() {
+        assert!(!is_tool_available("definitely-not-a-real-scanner-binary"));
+        assert!(is_tool_available("sh") || is_tool_available("/bin/sh"));
+        assert!(!is_tool_available("/definitely/missing/binary"));
+    }
+
+    #[test]
+    fn clone_urls_are_restricted_to_public_https_remotes() {
+        assert_eq!(
+            validated_clone_url("https://github.com/owner/repo").unwrap(),
+            "https://github.com/owner/repo"
+        );
+        for rejected in [
+            "file:///etc",
+            "git@github.com:owner/repo.git",
+            "ssh://github.com/owner/repo",
+            "--upload-pack=touch /tmp/pwned",
+            "https://user:token@github.com/owner/repo",
+            "https://github.com/owner/repo --config=core.sshCommand=id",
+        ] {
+            assert!(
+                validated_clone_url(rejected).is_err(),
+                "{rejected} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_directories_are_bounded_and_always_removed() {
+        let root = std::env::temp_dir().join(format!("scanner-checkout-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("blob.bin"), vec![0_u8; 4096]).unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/blob.bin"), vec![0_u8; 4096]).unwrap();
+
+        assert!(directory_size_bytes(&root, u64::MAX) >= 8192);
+        // Early exit: the walk stops as soon as the limit is passed.
+        assert!(directory_size_bytes(&root, 1024) > 1024);
+
+        let checkout = SourceCheckout { path: root.clone() };
+        drop(checkout);
+        assert!(!root.exists(), "checkout directory must be removed on drop");
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_non_https_urls_without_touching_the_filesystem() {
+        let options = CheckoutOptions::default();
+        let error = SourceCheckout::shallow_clone("file:///etc", &options)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("https"), "unexpected error: {error}");
     }
 
     #[tokio::test]

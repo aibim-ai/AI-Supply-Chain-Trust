@@ -50,7 +50,15 @@ export function ContextReport({ repository, payload }) {
     highCount = fingerprints.filter(
       (fp) => severityRank(fp.severity) >= 3,
     ).length,
-    generated = payload.generated_at || context.generated_at || "unknown";
+    generated = payload.generated_at || context.generated_at || "unknown",
+    commitsScanned = Number(context.commits_scanned || 0),
+    // `commits_flagged` counts security-relevant commits and is clamped to
+    // `commits_scanned` by the backend. The policy-finding count it used to be
+    // confused with now has its own key and its own row below.
+    commitsFlagged = Number(context.commits_flagged || 0),
+    policyFlags = Number(
+      context.policy_flags ?? (payload.critical_flags || []).length ?? 0,
+    );
   const evidenceGaps = rowsFrom(
     trust.missing_evidence || payload.missing_evidence,
   );
@@ -354,7 +362,14 @@ export function ContextReport({ repository, payload }) {
               <SeverityPill value={summary.top_severity || "none"} />
             </dd>
             <dt>Commits</dt>
-            <dd>{Number(context.commits_scanned || 0).toLocaleString()}</dd>
+            <dd>
+              {commitsScanned.toLocaleString()} scanned
+              {commitsFlagged > 0
+                ? ` · ${commitsFlagged.toLocaleString()} flagged`
+                : ""}
+            </dd>
+            <dt>Policy findings</dt>
+            <dd>{policyFlags.toLocaleString()}</dd>
           </dl>
           <div className="sc-coverage">
             <div>

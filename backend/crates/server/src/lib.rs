@@ -28,6 +28,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use url::Url;
 
+mod seo;
+
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<Service>,
@@ -462,7 +464,7 @@ pub async fn serve(
         .route("/sitemap.xml", get(sitemap_xml))
         .route("/r/*path", get(security_context_artifact))
         .route("/mcp", get(mcp_info).post(mcp_handler))
-        .fallback_service(get(serve_static))
+        .fallback(get(serve_frontend))
         .layer(cors_layer()?)
         .with_state(state);
 
@@ -481,6 +483,9 @@ pub async fn serve(
     Ok(())
 }
 
+// The struct update below is redundant *today* — that is the point: it keeps a
+// new field in `crates/service` from breaking this crate's build.
+#[allow(clippy::needless_update)]
 fn service_config_from_env() -> ServiceConfig {
     ServiceConfig {
         github_rate_limit_backoff_seconds: std::env::var(
@@ -528,6 +533,9 @@ fn service_config_from_env() -> ServiceConfig {
                 .as_str(),
             "off" | "disabled" | "none"
         ),
+        // Every field above is env-overridable; a new field added in
+        // `crates/service` must not break this crate's build.
+        ..ServiceConfig::default()
     }
 }
 
@@ -1869,7 +1877,25 @@ async fn suggest(
     Query(p): Query<SuggestQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let q = p.q.ok_or(StatusCode::BAD_REQUEST)?;
-    Ok(Json(state.service.suggest(&q).await))
+    Ok(Json(with_aligned_suggest_scores(
+        state.service.suggest(&q).await,
+    )))
+}
+
+/// `/api/v1/recent-scans`, `/api/v1/leaderboard` and `/api/v1/result` all
+/// publish the trust score as `trust_score`; suggestions published it only as
+/// `score`. Publish both: `trust_score` is the aligned name, `score` stays for
+/// existing clients (`frontend/src/lib/repository-search.js` reads either).
+fn with_aligned_suggest_scores(mut payload: Value) -> Value {
+    if let Some(candidates) = payload.get_mut("candidates").and_then(Value::as_array_mut) {
+        for candidate in candidates {
+            let score = candidate.get("score").cloned().unwrap_or(Value::Null);
+            if let Some(candidate) = candidate.as_object_mut() {
+                candidate.entry("trust_score").or_insert(score);
+            }
+        }
+    }
+    payload
 }
 
 async fn scoring_versions(State(state): State<AppState>) -> Json<Value> {
@@ -1941,37 +1967,66 @@ async fn failure_ack_handler(
     }
 }
 
-const SITEMAP_REPOSITORY_LIMIT: usize = 500;
+/// One sitemap file may carry 50,000 URLs (and 50 MB uncompressed) per the
+/// sitemap protocol. Six of those are the core pages, so the repository
+/// inventory gets the rest. Crossing this ceiling means splitting into a
+/// sitemap index of several files — see the handoff note in the module docs
+/// for `sitemap_xml`; at ~385 repositories that is still far away.
+const SITEMAP_URL_LIMIT: usize = 50_000;
+const SITEMAP_REPOSITORY_LIMIT: usize = SITEMAP_URL_LIMIT - SITEMAP_CORE_PAGES.len();
+
+/// `(path, priority, changefreq)` for the pages that are not repositories.
+const SITEMAP_CORE_PAGES: [(&str, &str, &str); 6] = [
+    ("/", "1.0", "daily"),
+    ("/contexts", "0.9", "daily"),
+    ("/leaderboard", "0.8", "daily"),
+    ("/about", "0.6", "monthly"),
+    ("/editorial-policy", "0.6", "monthly"),
+    ("/privacy", "0.5", "monthly"),
+];
+
+/// The editorial pages only change when their copy changes, so they carry a
+/// pinned date instead of pretending to change with every scan. Bump this when
+/// `/about`, `/editorial-policy` or `/privacy` are edited.
+const EDITORIAL_PAGES_LASTMOD: &str = "2026-07-30";
 
 async fn sitemap_xml(State(state): State<AppState>) -> Response {
     let base = state.base_url.trim_end_matches('/');
     let recent = state.service.recent_scans(SITEMAP_REPOSITORY_LIMIT as i64);
-    let core_pages = [
-        ("/", "1.0", "daily"),
-        ("/contexts", "0.9", "daily"),
-        ("/leaderboard", "0.8", "daily"),
-        ("/about", "0.6", "monthly"),
-        ("/editorial-policy", "0.6", "monthly"),
-        ("/privacy", "0.5", "monthly"),
-    ];
+    let rows = recent.get("rows").and_then(Value::as_array);
+
+    // The listing pages change whenever a scan lands, so their <lastmod> is the
+    // newest evaluation we publish.
+    let newest_evaluation = rows
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("evaluated_at").and_then(Value::as_str))
+        .filter(|value| is_w3c_date(value))
+        .max()
+        .map(str::to_string);
 
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 "#,
     );
-    for (path, priority, changefreq) in core_pages {
+    for (path, priority, changefreq) in SITEMAP_CORE_PAGES {
+        let lastmod = if changefreq == "daily" {
+            newest_evaluation.as_deref()
+        } else {
+            Some(EDITORIAL_PAGES_LASTMOD)
+        };
         append_sitemap_url(
             &mut xml,
             &format!("{base}{path}"),
-            None,
+            lastmod,
             priority,
             changefreq,
         );
     }
 
     let mut seen_repositories = std::collections::BTreeSet::new();
-    if let Some(rows) = recent.get("rows").and_then(Value::as_array) {
+    if let Some(rows) = rows {
         for row in rows.iter().take(SITEMAP_REPOSITORY_LIMIT) {
             if let Some(repo) = row.get("repo").and_then(Value::as_str) {
                 let repo = repo.trim_matches('/');
@@ -2261,6 +2316,116 @@ fn prometheus_label_value(value: Option<&str>) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// SPA fallback: serves the frontend shell with server-rendered route metadata.
+///
+/// Real files (bundles, icons, `robots.txt`, …) and the legacy `/free-tools`
+/// redirects keep going through [`serve_static`] untouched.
+async fn serve_frontend(
+    State(state): State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
+    if !is_spa_document_path(&path) || static_file_exists(&path) {
+        return serve_static(req).await;
+    }
+    let headers = req.headers().clone();
+    render_spa_document(&state, &headers, &path, query.as_deref()).await
+}
+
+fn is_spa_document_path(path: &str) -> bool {
+    if path == "/free-tools" || path.starts_with("/free-tools/") {
+        return false;
+    }
+    let trimmed = path.trim_start_matches('/');
+    if !is_safe_static_path(trimmed) {
+        return false;
+    }
+    trimmed.is_empty() || std::path::Path::new(trimmed).extension().is_none()
+}
+
+fn static_file_exists(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || !is_safe_static_path(trimmed) {
+        return false;
+    }
+    let candidate = std::path::Path::new(&frontend_web_dir()).join(trimmed);
+    candidate.is_file()
+}
+
+async fn render_spa_document(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    query: Option<&str>,
+) -> axum::response::Response {
+    let Some(shell) = read_frontend_shell().await else {
+        return axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("Not found"))
+            .unwrap();
+    };
+    let route = seo::resolve_route(path, query);
+    let origin = request_origin(headers, &state.base_url);
+    let report = seo::route_repository(&route).and_then(|repo| state.service.get_result(repo));
+    let document = seo::render_document(&shell, &route, &origin, report.as_ref());
+
+    axum::response::Response::builder()
+        .header("Content-Type", "text/html")
+        .header("Cache-Control", "no-cache, no-store, must-revalidate")
+        .body(axum::body::Body::from(document))
+        .unwrap()
+}
+
+async fn read_frontend_shell() -> Option<String> {
+    let path = std::path::Path::new(&frontend_web_dir()).join("index.html");
+    tokio::fs::read_to_string(path).await.ok()
+}
+
+/// Absolute origin for canonical/OG URLs, taken from the request so dev,
+/// preview and production each describe themselves. Falls back to the
+/// configured public base URL when the forwarded host is absent or not a
+/// plausible host (headers are attacker-controlled).
+fn request_origin(headers: &HeaderMap, base_url: &str) -> String {
+    let fallback = base_url.trim_end_matches('/').to_string();
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let Some(host) = header_value("x-forwarded-host")
+        .or_else(|| header_value(header::HOST.as_str()))
+        .filter(|host| is_plausible_host(host))
+    else {
+        return fallback;
+    };
+    let scheme = header_value("x-forwarded-proto")
+        .filter(|scheme| *scheme == "http" || *scheme == "https")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let host_only = host.split(':').next().unwrap_or(host);
+            if matches!(host_only, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]")
+                || fallback.starts_with("http://")
+            {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        });
+    format!("{scheme}://{host}")
+}
+
+fn is_plausible_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':' | '[' | ']')
+        })
 }
 
 async fn serve_static(req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
@@ -2612,6 +2777,7 @@ async fn mcp_handler(
 async fn security_context_artifact(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
     let path = path.trim_matches('/');
     let (repo, format) = if let Some(repo) = path.strip_suffix(".leads.json") {
@@ -2632,11 +2798,8 @@ async fn security_context_artifact(
     }
 
     if format == "html" {
-        let req = axum::http::Request::builder()
-            .uri("/")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        return serve_static(req).await;
+        // The SPA shell, described for *this* repository rather than for "/".
+        return render_spa_document(&state, &headers, &format!("/r/{repo}"), None).await;
     }
 
     let ctx = state.service.get_security_context(repo, &state.base_url);
@@ -3255,13 +3418,329 @@ mod tests {
             sse_permits: Arc::new(Semaphore::new(100)),
         };
 
-        let response =
-            security_context_artifact(State(state), Path("wolfssl/wolfssl".to_string())).await;
+        let response = security_context_artifact(
+            State(state),
+            Path("wolfssl/wolfssl".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let text = response_text(response).await;
         assert!(text.contains("app-header"));
         assert!(text.contains("/assets/js/app.js"));
         assert!(!text.contains("<body><section class=\"securitycontext-page\">"));
+    }
+
+    fn test_state(db: Arc<Database>, base_url: &str) -> AppState {
+        AppState {
+            service: Arc::new(Service::new(db, None)),
+            base_url: base_url.to_string(),
+            worker_token: None,
+            discovery_token_configured: false,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
+            max_queued_scans: 100,
+            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
+            scan_permits: Arc::new(Semaphore::new(4)),
+            sse_permits: Arc::new(Semaphore::new(100)),
+        }
+    }
+
+    async fn spa_document(state: &AppState, uri: &str) -> String {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = serve_frontend(State(state.clone()), req).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        response_text(response).await
+    }
+
+    /// Counts raw occurrences in the response body: a DOM parser would tolerate
+    /// the duplicate `<title>`/description that the shipped shell carries, and
+    /// duplicates are exactly what breaks crawlers.
+    fn assert_single_managed_tags(document: &str, route: &str) {
+        let occurrences = |needle: &str| document.matches(needle).count();
+        assert_eq!(occurrences("<title"), 1, "duplicate <title> on {route}");
+        assert_eq!(occurrences("</title>"), 1, "duplicate </title> on {route}");
+        assert_eq!(
+            occurrences("name=\"description\""),
+            1,
+            "duplicate description on {route}"
+        );
+        assert_eq!(
+            occurrences("rel=\"canonical\""),
+            1,
+            "duplicate canonical on {route}"
+        );
+        for identity in [
+            "og:title",
+            "og:description",
+            "og:url",
+            "og:type",
+            "og:site_name",
+            "twitter:card",
+            "twitter:title",
+            "twitter:description",
+        ] {
+            assert_eq!(occurrences(identity), 1, "duplicate {identity} on {route}");
+        }
+        assert!(
+            occurrences("application/ld+json") <= 1,
+            "more than one JSON-LD block on {route}"
+        );
+        assert!(
+            !document.contains("<!--SSR_HEAD-->"),
+            "placeholder left on {route}"
+        );
+        assert!(
+            !document.contains("Agent-ready security context for public software repositories."),
+            "shipped generic description survived on {route}"
+        );
+        assert!(
+            !document.contains("<title>AI Supply Chain Trust</title>"),
+            "shipped generic title survived on {route}"
+        );
+    }
+
+    /// The served shell (`frontend/web/index.html`) already carries a generic
+    /// `<title>` and description *before* the placeholder, so injection has to
+    /// replace them rather than append beside them.
+    #[tokio::test]
+    async fn every_spa_route_serves_one_of_each_managed_seo_tag() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        for route in [
+            "/",
+            "/contexts",
+            "/leaderboard",
+            "/result",
+            "/result?repo=ollama%2Follama",
+            "/about",
+            "/editorial-policy",
+            "/privacy",
+            "/r/ollama/ollama",
+            "/definitely-not-a-route",
+        ] {
+            let document = spa_document(&state, route).await;
+            assert_single_managed_tags(&document, route);
+            assert!(document.contains("/assets/js/app.js"), "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spa_routes_publish_distinct_titles_and_canonicals() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        let home = spa_document(&state, "/").await;
+        assert!(home
+            .contains("<title>AI Supply Chain Trust — public repository security context</title>"));
+        assert!(home.contains("<link rel=\"canonical\" href=\"https://example.test/\" />"));
+        assert!(home.contains("content=\"website\""));
+        assert_eq!(home.matches("application/ld+json").count(), 1);
+        assert!(home.contains("\"@id\":\"https://example.test/#website\""));
+        assert!(home.contains("\"@id\":\"https://example.test/#organization\""));
+
+        let leaderboard = spa_document(&state, "/leaderboard").await;
+        assert!(leaderboard
+            .contains("<title>Repository trust leaderboard | AI Supply Chain Trust</title>"));
+        assert!(leaderboard.contains("href=\"https://example.test/leaderboard\""));
+        assert_eq!(leaderboard.matches("application/ld+json").count(), 0);
+
+        let privacy = spa_document(&state, "/privacy").await;
+        assert!(privacy.contains("<title>Privacy | AI Supply Chain Trust</title>"));
+        assert!(privacy.contains("href=\"https://example.test/privacy\""));
+
+        let result = spa_document(&state, "/result?repo=ollama%2Follama").await;
+        assert!(result.contains("href=\"https://example.test/result?repo=ollama%2Follama\""));
+    }
+
+    #[tokio::test]
+    async fn only_the_not_found_route_publishes_robots() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        let missing = spa_document(&state, "/definitely-not-a-route").await;
+        assert_eq!(missing.matches("name=\"robots\"").count(), 1);
+        assert!(missing.contains("content=\"noindex, follow\""));
+
+        for route in ["/", "/contexts", "/about", "/r/ollama/ollama"] {
+            let document = spa_document(&state, route).await;
+            assert_eq!(
+                document.matches("robots").count(),
+                0,
+                "robots leaked onto {route}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_route_publishes_the_stored_report() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.insert_report(&json!({
+            "repo": "ollama/ollama",
+            "evaluated_at": "2026-07-11",
+            "trust_score": 74.6,
+            "grade": "B",
+            "verdict": "Review with known gaps",
+            "action": "Complete missing evidence before approval",
+            "next_review_date": "2026-10-09",
+            "coverage": "5/7",
+            "critical_flags": [],
+            "pillar_scores": {},
+            "scanner_runs": [],
+            "observed_metrics": {},
+            "scoring_version": "v1"
+        }))
+        .unwrap();
+        let state = test_state(db, "https://example.test");
+
+        // Both the `/r/*path` artifact route and the SPA fallback describe it.
+        let via_artifact = response_text(
+            security_context_artifact(
+                State(state.clone()),
+                Path("ollama/ollama".to_string()),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        let via_fallback = spa_document(&state, "/r/ollama/ollama").await;
+
+        for document in [&via_artifact, &via_fallback] {
+            assert_single_managed_tags(document, "/r/ollama/ollama");
+            assert!(document.contains(
+                "<title>ollama/ollama — trust grade B 75/100 | AI Supply Chain Trust</title>"
+            ));
+            assert!(document.contains("content=\"article\""));
+            assert!(document
+                .contains("Review with known gaps (trust grade B 75/100) — evidence-backed"));
+            assert!(document.contains("\"@type\":\"SoftwareSourceCode\""));
+            assert_eq!(document.matches("application/ld+json").count(), 1);
+            // Crawlable stub instead of an empty <div id="root">.
+            assert!(document.contains("<h1>ollama/ollama security context</h1>"));
+            assert!(!document.contains("<!--SSR_MAIN-->"));
+            assert!(!document.contains("<div id=\"root\"></div>"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unscanned_repository_degrades_to_generic_metadata() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        let document = spa_document(&state, "/r/unknown/repository").await;
+
+        assert_single_managed_tags(&document, "/r/unknown/repository");
+        assert!(document.contains(
+            "<title>unknown/repository security context | AI Supply Chain Trust</title>"
+        ));
+        assert!(document.contains(
+            "Evidence-backed security context for the public GitHub repository unknown/repository"
+        ));
+        assert!(!document.contains("/100"));
+        assert!(!document.contains("undefined"));
+    }
+
+    /// A repository slug is untrusted URL input; so is the Host header.
+    #[tokio::test]
+    async fn hostile_repository_paths_cannot_inject_markup() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        for hostile in [
+            "/r/owner/repo%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            "/r/owner/%3C%2Ftitle%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            "/result?repo=%22%3E%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+        ] {
+            let document = spa_document(&state, hostile).await;
+            assert_single_managed_tags(&document, hostile);
+            assert!(!document.contains("<script>alert"), "{document}");
+            assert!(!document.contains("<img"), "{document}");
+            assert!(!document.contains("\"><script"), "{document}");
+            assert!(!document.contains("</title><"), "{document}");
+            // Whatever survives does so only as escaped text.
+            assert!(
+                document.contains("&lt;") || document.contains("%3C") || document.contains("%253C"),
+                "{document}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_urls_follow_the_request_host() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://production.test");
+
+        let forwarded = Request::builder()
+            .uri("/contexts")
+            .header(header::HOST, "internal:8000")
+            .header("x-forwarded-host", "preview.example.test")
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .unwrap();
+        let document = response_text(serve_frontend(State(state.clone()), forwarded).await).await;
+        assert!(document.contains("href=\"https://preview.example.test/contexts\""));
+
+        let local = Request::builder()
+            .uri("/contexts")
+            .header(header::HOST, "localhost:5173")
+            .body(Body::empty())
+            .unwrap();
+        let document = response_text(serve_frontend(State(state.clone()), local).await).await;
+        assert!(document.contains("href=\"http://localhost:5173/contexts\""));
+
+        // A hostile Host header falls back to the configured base URL.
+        let spoofed = Request::builder()
+            .uri("/contexts")
+            .header(header::HOST, "evil.test/\"><script>alert(1)</script>")
+            .body(Body::empty())
+            .unwrap();
+        let document = response_text(serve_frontend(State(state), spoofed).await).await;
+        assert!(document.contains("href=\"https://production.test/contexts\""));
+        assert!(!document.contains("<script>alert"));
+    }
+
+    #[tokio::test]
+    async fn static_assets_still_bypass_the_seo_layer() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let state = test_state(db, "https://example.test");
+
+        let req = Request::builder()
+            .uri("/robots.txt")
+            .body(Body::empty())
+            .unwrap();
+        let response = serve_frontend(State(state.clone()), req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(!text.contains("<title>"));
+
+        let redirect = Request::builder()
+            .uri("/free-tools/r/owner/repo")
+            .body(Body::empty())
+            .unwrap();
+        let response = serve_frontend(State(state.clone()), redirect).await;
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+
+        let traversal = Request::builder()
+            .uri("/../Cargo.toml")
+            .body(Body::empty())
+            .unwrap();
+        let response = serve_frontend(State(state), traversal).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn suggestions_publish_the_aligned_score_field() {
+        let payload = with_aligned_suggest_scores(json!({
+            "candidates": [
+                {"repo": "owner/scanned", "score": 74.5, "source": "scanned"},
+                {"repo": "owner/remote", "score": Value::Null, "source": "github"}
+            ]
+        }));
+
+        let candidates = payload["candidates"].as_array().unwrap();
+        assert_eq!(candidates[0]["trust_score"], json!(74.5));
+        assert_eq!(candidates[0]["score"], json!(74.5), "legacy field kept");
+        assert_eq!(candidates[1]["trust_score"], Value::Null);
     }
 
     #[tokio::test]
@@ -3339,52 +3818,70 @@ mod tests {
         assert!(!text.contains("https://example.test/recent-scans"));
     }
 
+    /// The sitemap protocol allows 50,000 URLs per file. Anything smaller
+    /// silently truncates the repository inventory, which is the whole reason
+    /// this page exists.
+    #[test]
+    fn sitemap_limit_matches_the_sitemap_protocol() {
+        assert_eq!(SITEMAP_URL_LIMIT, 50_000);
+        assert_eq!(
+            SITEMAP_REPOSITORY_LIMIT + SITEMAP_CORE_PAGES.len(),
+            SITEMAP_URL_LIMIT
+        );
+    }
+
     #[tokio::test]
-    async fn sitemap_prioritizes_core_pages_and_limits_repository_inventory() {
+    async fn sitemap_publishes_every_repository_and_dates_the_core_pages() {
         let db = Arc::new(Database::open_memory().unwrap());
-        for index in 0..=SITEMAP_REPOSITORY_LIMIT {
-            db.insert_report(&json!({
-                "repo": format!("owner/repo-{index}"),
-                "evaluated_at": "2026-07-14",
-                "trust_score": 75.0,
-                "grade": "B",
-                "verdict": "Review",
-                "action": "Review",
-                "next_review_date": "2026-10-12",
-                "coverage": "3/7",
-                "critical_flags": [],
-                "pillar_scores": {},
-                "scanner_runs": [],
-                "observed_metrics": {},
-                "scoring_version": "v1"
-            }))
-            .unwrap();
+        for index in 0..25 {
+            // Every repository is rescanned, so a row window over `evaluations`
+            // would cover only a fraction of them.
+            for round in 0..4 {
+                db.insert_report(&json!({
+                    "repo": format!("owner/repo-{index}"),
+                    "evaluated_at": format!("2026-07-{:02}", 10 + round),
+                    "trust_score": 75.0,
+                    "grade": "B",
+                    "verdict": "Review",
+                    "action": "Review",
+                    "next_review_date": "2026-10-12",
+                    "coverage": "3/7",
+                    "critical_flags": [],
+                    "pillar_scores": {},
+                    "scanner_runs": [],
+                    "observed_metrics": {},
+                    "scoring_version": "v1"
+                }))
+                .unwrap();
+            }
         }
-        let state = AppState {
-            service: Arc::new(Service::new(db, None)),
-            base_url: "https://example.test".to_string(),
-            worker_token: None,
-            discovery_token_configured: false,
-            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(10, 60))),
-            max_queued_scans: 100,
-            feedback_limiter: Arc::new(Mutex::new(RateLimiter::new(3, 600))),
-            scan_permits: Arc::new(Semaphore::new(4)),
-            sse_permits: Arc::new(Semaphore::new(100)),
-        };
+        let state = test_state(db, "https://example.test");
 
         let text = response_text(sitemap_xml(State(state)).await).await;
 
         assert_eq!(
             text.matches("  <url>\n").count(),
-            SITEMAP_REPOSITORY_LIMIT + 6
+            25 + SITEMAP_CORE_PAGES.len(),
+            "every tracked repository must be published"
         );
+        for index in 0..25 {
+            assert!(
+                text.contains(&format!(
+                    "<loc>https://example.test/r/owner/repo-{index}</loc>"
+                )),
+                "missing repository {index}"
+            );
+        }
         assert!(
             text.find("<loc>https://example.test/</loc>").unwrap()
                 < text
-                    .find("<loc>https://example.test/r/owner/repo-500</loc>")
+                    .find("<loc>https://example.test/r/owner/repo-0</loc>")
                     .unwrap()
         );
-        assert!(text.contains("/r/owner/repo-500"));
-        assert!(!text.contains("/r/owner/repo-0</loc>"));
+        // All six core pages carry a <lastmod>.
+        let core_section = &text[..text.find("/r/owner/").unwrap()];
+        assert_eq!(core_section.matches("<lastmod>").count(), 6);
+        assert!(core_section.contains("<lastmod>2026-07-13</lastmod>"));
+        assert!(core_section.contains(&format!("<lastmod>{EDITORIAL_PAGES_LASTMOD}</lastmod>")));
     }
 }

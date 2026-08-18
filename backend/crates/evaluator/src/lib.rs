@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use ai_supply_chain_trust_models::{EvaluationResult, Finding, PillarResult, ScannerRun, Severity};
+use ai_supply_chain_trust_models::{EvaluationResult, Finding, PillarResult, ScannerRun};
 use ai_supply_chain_trust_scoring::{composite_score, grade_for_score, next_review_date};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use tracing::info;
@@ -151,9 +151,22 @@ pub fn evaluate_repository(
         let score = result.score;
         let result = result.with_score(score, max_score);
 
-        for flag in &result.concerns {
-            if result.normalized_score <= 2.0 {
-                critical_flags.push(Finding::new(key.clone(), Severity::High, flag.clone()));
+        // Critical-flag rule (policy block / auto-fail → grade F):
+        // a pillar blocks ONLY when it emitted a structured finding that
+        // explicitly marks itself blocking (`automatic_fail == true`).
+        //
+        // Severity alone does not block: a Critical-severity finding is a
+        // strong signal for the report, but the pillar that raised it decides
+        // whether it is policy-blocking by calling `Finding::with_automatic_fail`.
+        //
+        // The previous rule ("every concern string on any pillar scoring <= 2.0
+        // is a critical flag") was removed: it re-invented blocking findings from
+        // free text, discarding severity and auto-fail, and turned ordinary
+        // low-signal concerns — e.g. "Owner unknown has very few stars on this
+        // repo." or a missing owner-metadata timestamp — into policy blocks.
+        for finding in &result.findings {
+            if finding.automatic_fail {
+                critical_flags.push(finding.clone());
             }
         }
 
@@ -186,6 +199,7 @@ pub fn evaluate_repository(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_supply_chain_trust_models::Severity;
     use chrono::NaiveDate;
     use serde_json::json;
     use std::collections::HashMap;
@@ -312,6 +326,125 @@ mod tests {
         assert!(!scorecard.applicable);
         assert!(!scorecard.unavailable.is_empty());
         assert_eq!(scorecard.normalized_score, 0.0);
+    }
+
+    /// Regression for the production false-F path: owner metadata arrives as
+    /// `{}` (the real account is 7 years old) and the repository is 6 days old.
+    /// Missing owner metadata and a low star count are evidence gaps, not policy
+    /// violations, so this must not be F / policy_block.
+    #[test]
+    fn missing_owner_metadata_does_not_produce_policy_block() {
+        let evidence = empty_evidence(json!({
+            "full_name": "KasraAhmadi/job-eval",
+            "created_at": "2026-08-11T00:00:00Z",
+            "pushed_at": "2026-08-15T00:00:00Z",
+            "stargazers_count": 1,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "license": null,
+            "archived": false,
+            "disabled": false,
+            "owner": {}
+        }));
+
+        let result = evaluate_repository(
+            "KasraAhmadi/job-eval",
+            None,
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+            evidence,
+        );
+
+        assert!(
+            result.critical_flags.is_empty(),
+            "unknown owner metadata must not policy-block: {:?}",
+            result.critical_flags
+        );
+        assert!(!result.override_applied, "no auto-fail override expected");
+        assert_ne!(
+            result.verdict, "Blocked by policy signal",
+            "missing owner metadata is an evidence gap, not a policy violation"
+        );
+        // The grade must be exactly what the score earns — no override.
+        let (score_grade, _, _, _) =
+            ai_supply_chain_trust_scoring::grade_for_score(result.trust_score, &[]);
+        assert_eq!(result.grade, score_grade);
+        // Low-signal concerns are still reported, just not blocking.
+        let publisher = result.pillar_scores.get("publisher_credibility").unwrap();
+        assert!(publisher
+            .concerns
+            .iter()
+            .any(|c| c.contains("creation timestamp unavailable")));
+    }
+
+    /// A genuinely blocking finding (known publisher account age < 30 days on a
+    /// non-organization) must still force grade F end-to-end.
+    #[test]
+    fn known_new_publisher_account_still_forces_policy_block() {
+        let evidence = empty_evidence(json!({
+            "full_name": "newuser/thing",
+            "created_at": "2026-08-11T00:00:00Z",
+            "pushed_at": "2026-08-15T00:00:00Z",
+            "stargazers_count": 0,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "license": null,
+            "archived": false,
+            "disabled": false,
+            "owner": {"login": "newuser", "type": "User", "created_at": "2026-08-01T00:00:00Z"}
+        }));
+
+        let result = evaluate_repository(
+            "newuser/thing",
+            None,
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+            evidence,
+        );
+
+        assert_eq!(result.grade, ai_supply_chain_trust_models::Grade::F);
+        assert_eq!(result.verdict, "Blocked by policy signal");
+        assert!(
+            result
+                .critical_flags
+                .iter()
+                .any(|f| f.code == "account_takeover" && f.automatic_fail),
+            "expected the account_takeover auto-fail to propagate: {:?}",
+            result.critical_flags
+        );
+    }
+
+    /// Structured findings survive the pillar boundary (severity + auto-fail).
+    #[test]
+    fn pillar_findings_are_preserved_on_the_result() {
+        let evidence = empty_evidence(json!({
+            "full_name": "newuser/thing",
+            "created_at": "2026-08-11T00:00:00Z",
+            "pushed_at": "2026-08-15T00:00:00Z",
+            "stargazers_count": 0,
+            "archived": false,
+            "disabled": false,
+            "owner": {"login": "newuser", "type": "User", "created_at": "2026-08-01T00:00:00Z"}
+        }));
+
+        let result = evaluate_repository(
+            "newuser/thing",
+            None,
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+            evidence,
+        );
+
+        let scap = result
+            .pillar_scores
+            .get("supply_chain_attack_prediction")
+            .unwrap();
+        let finding = scap
+            .findings
+            .iter()
+            .find(|f| f.code == "account_takeover")
+            .expect("account_takeover finding should be on the pillar result");
+        assert!(finding.automatic_fail);
+        assert_eq!(finding.severity, Severity::Critical);
+        // Concern text is still mirrored for the report UI.
+        assert!(scap.concerns.iter().any(|c| c == &finding.message));
     }
 
     #[test]

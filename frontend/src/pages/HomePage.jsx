@@ -14,7 +14,9 @@ import HowItWorksPipeline from "../components/HowItWorksPipeline";
 import ScanHeroBackground from "../components/ScanHeroBackground";
 import { PublicContextList } from "../features/repositories/RepositoryViews";
 import { useAsync } from "../hooks/use-async";
+import { useDocumentMeta } from "../hooks/use-document-meta";
 import { trustApi } from "../lib/api-client";
+import { SITE_NAME, websiteJsonLd } from "../lib/seo";
 import { captureProductEvent, createScanAttempt } from "../lib/posthog";
 import {
   buildSearchCandidates,
@@ -22,7 +24,16 @@ import {
 } from "../lib/repository-search";
 import { isRepository, normalizeRepository } from "../lib/repository";
 
+const HOME_DESCRIPTION =
+  "Scan any public GitHub repository for a traceable security context: repository history, disclosed CVEs, missing evidence, and ranked review leads.";
+
 export default function HomePage() {
+  useDocumentMeta({
+    title: `${SITE_NAME} — public repository security context`,
+    description: HOME_DESCRIPTION,
+    path: "/",
+    jsonLd: websiteJsonLd({ description: HOME_DESCRIPTION }),
+  });
   const navigate = useNavigate(),
     home = useAsync(async () => {
       try {
@@ -493,10 +504,26 @@ function SearchDropdown({
   );
 }
 
+// /api/v1/recent-scans and /api/v1/leaderboard publish the score as
+// `trust_score`; only /api/v1/suggest mirrors it as `score`. Read both, plus
+// the merged prior scan carried on the candidate, the same way
+// RepositoryViews does.
+function scoreValue(candidate) {
+  const raw =
+    candidate.trust_score ??
+    candidate.score ??
+    candidate.prior?.trust_score ??
+    candidate.prior?.score ??
+    candidate.summary?.trust_score ??
+    candidate.prior?.summary?.trust_score;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const score = Number(raw);
+  return Number.isFinite(score) ? score : null;
+}
+
 function scoreText(candidate) {
-  const score = Number(candidate.score);
-  if (Number.isFinite(score)) return Math.round(score);
-  return "-";
+  const score = scoreValue(candidate);
+  return score === null ? "-" : Math.round(score);
 }
 
 function metricText(candidate) {

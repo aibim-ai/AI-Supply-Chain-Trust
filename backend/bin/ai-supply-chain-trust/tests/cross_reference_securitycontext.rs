@@ -28,7 +28,15 @@ mod cross_reference {
 
     /// For each test repo, run create_security_context twice and assert
     /// deterministic output (fingerprints, known_cves, commits_scanned,
-    /// commits_flagged) excluding generated_at/head_sha.
+    /// commits_flagged, policy_flags) excluding generated_at/head_sha.
+    ///
+    /// `commits_flagged` counts *commits*: the distinct fix-commit SHAs found
+    /// by the history scan, clamped so it can never exceed `commits_scanned`.
+    /// The count of policy findings lives in `policy_flags`. It used to be
+    /// reported as `commits_flagged`, which produced impossible pairs such as
+    /// `commits_scanned: 1, commits_flagged: 2` — two flagged commits out of
+    /// one scanned. The assertions below are baselined on the corrected
+    /// semantics.
     #[tokio::test]
     #[ignore = "requires GITHUB_TOKEN"]
     async fn deterministic_output_for_fixed_repos() {
@@ -66,7 +74,121 @@ mod cross_reference {
                 (Err(e1), _) => eprintln!("{repo} scan 1 failed (may be rate-limited): {e1}"),
                 (_, Err(e2)) => eprintln!("{repo} scan 2 failed (may be rate-limited): {e2}"),
             }
+
+            let context = service.get_security_context(repo, "http://localhost");
+            let Some(counts) = context.get("context") else {
+                continue;
+            };
+            let scanned = counts
+                .get("commits_scanned")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let flagged = counts
+                .get("commits_flagged")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            assert!(
+                flagged <= scanned,
+                "{repo}: commits_flagged ({flagged}) must never exceed commits_scanned ({scanned})"
+            );
+            assert!(
+                counts
+                    .get("policy_flags")
+                    .and_then(|v| v.as_i64())
+                    .is_some(),
+                "{repo}: policy findings must be reported as policy_flags"
+            );
         }
+    }
+
+    /// Re-baselined cross-reference of the commit counters against a report
+    /// whose contents are known exactly.
+    ///
+    /// `commits_flagged` now answers "how many commits did the history scan
+    /// flag?" — distinct fix-commit SHAs, deduplicated and clamped to
+    /// `commits_scanned`. It no longer answers "how many policy findings does
+    /// this report carry?", which is `policy_flags`. The two are different
+    /// quantities over different populations, and conflating them produced
+    /// output that could not be true (more flagged commits than scanned ones)
+    /// while hiding the policy count entirely.
+    #[test]
+    fn commit_counters_separate_flagged_commits_from_policy_findings() {
+        use ai_supply_chain_trust_security_context::context_from_report;
+
+        let report = json!({
+            "repo": "owner/repo",
+            "evaluated_at": "2026-08-18",
+            "trust_score": 40.0,
+            "grade": "D",
+            "verdict": "Review",
+            "action": "Review",
+            "next_review_date": "2026-11-16",
+            "pillar_scores": {},
+            // Three policy findings, and a history scan that walked 5 commits
+            // and matched 2 distinct fix commits (one of them listed twice).
+            "critical_flags": [
+                {"category": "supply_chain", "severity": "critical", "message": "one"},
+                {"category": "supply_chain", "severity": "critical", "message": "two"},
+                {"category": "supply_chain", "severity": "critical", "message": "three"}
+            ],
+            "scanner_runs": [],
+            "observed_metrics": {
+                "security_context_version": "2026-07-14-history-precision-v2",
+                "verification_status": "ok",
+                "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                "metadata": {"default_branch": "main", "head_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"},
+                "security_intel": {
+                    "commit_count": 5,
+                    "fix_commits": [
+                        {"sha": "aaaaaaaaaaaa", "subject": "fix overflow"},
+                        {"sha": "aaaaaaaaaaaa", "subject": "fix overflow"},
+                        {"sha": "bbbbbbbbbbbb", "subject": "fix traversal"}
+                    ]
+                }
+            }
+        });
+
+        let context = context_from_report(&report, "owner/repo");
+
+        assert_eq!(context["commits_scanned"], json!(5));
+        // Two distinct fix commits — not three fix-commit entries, and not the
+        // three policy findings the old implementation counted here.
+        assert_eq!(context["commits_flagged"], json!(2));
+        assert_eq!(context["policy_flags"], json!(3));
+        assert!(
+            context["commits_flagged"].as_i64().unwrap()
+                <= context["commits_scanned"].as_i64().unwrap()
+        );
+    }
+
+    /// The clamp is the guard that makes the old impossible output
+    /// (`commits_scanned: 1, commits_flagged: 2`) unrepresentable.
+    #[test]
+    fn flagged_commits_are_clamped_to_the_commits_actually_scanned() {
+        use ai_supply_chain_trust_security_context::context_from_report;
+
+        let report = json!({
+            "repo": "owner/repo",
+            "evaluated_at": "2026-08-18",
+            "critical_flags": [{"category": "supply_chain", "severity": "critical", "message": "one"}],
+            "pillar_scores": {},
+            "scanner_runs": [],
+            "observed_metrics": {
+                "security_intel": {
+                    "commit_count": 1,
+                    "fix_commits": [
+                        {"sha": "aaaaaaaaaaaa", "subject": "fix one"},
+                        {"sha": "bbbbbbbbbbbb", "subject": "fix two"}
+                    ]
+                }
+            }
+        });
+
+        let context = context_from_report(&report, "owner/repo");
+
+        assert_eq!(context["commits_scanned"], json!(1));
+        assert_eq!(context["commits_flagged"], json!(1));
+        assert_eq!(context["policy_flags"], json!(1));
     }
 
     /// Verify our CVE count against live GHSA data for a known repo.

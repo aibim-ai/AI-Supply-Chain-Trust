@@ -122,6 +122,35 @@ describe("HomePage", () => {
     expect(await screen.findByText("Scan detail route")).toBeTruthy();
   });
 
+  it("reads the score from the trust_score field the scan APIs publish", async () => {
+    const user = userEvent.setup();
+    api.recent.mockResolvedValue({ rows: [] });
+    api.suggest.mockResolvedValue({
+      candidates: [
+        {
+          repo: "owner/anchored",
+          trust_score: 91.4,
+          grade: "A",
+          summary: { fixes: 3, cves: 0 },
+          source: "scanned",
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    await user.type(
+      screen.getByPlaceholderText("Paste a public GitHub URL or owner/repo"),
+      "anchored",
+    );
+
+    expect(await screen.findByText("score 91 · 3 fixes · 0 CVEs")).toBeTruthy();
+    expect(screen.getByText("91")).toBeTruthy();
+  });
+
   it("queues a repository that has no existing context", async () => {
     const user = userEvent.setup();
     render(

@@ -1,7 +1,9 @@
 import { Link, useSearchParams } from "react-router-dom";
 import { ErrorState, PageLoader } from "../components/ui";
 import { useAsync } from "../hooks/use-async";
+import { useDocumentMeta } from "../hooks/use-document-meta";
 import { trustApi } from "../lib/api-client";
+import { pageTitle } from "../lib/seo";
 
 export default function ResultPage() {
   const [params] = useSearchParams(),
@@ -22,6 +24,7 @@ export default function ResultPage() {
       intelligenceUnavailable: intelligence.status !== "fulfilled",
     };
   }, [repository]);
+  useDocumentMeta(resultMeta(repository, query.data?.report));
   if (query.status === "error")
     return (
       <section className="shell py-16">
@@ -198,6 +201,44 @@ export default function ResultPage() {
       </div>
     </section>
   );
+}
+
+// Titles the repository from the URL immediately so the loading state never
+// publishes a different title than the loaded report.
+function resultMeta(repository, report) {
+  const path = repository
+    ? `/result?repo=${encodeURIComponent(repository)}`
+    : "/result";
+  if (!repository)
+    return {
+      title: pageTitle("Trust verdict"),
+      description:
+        "Open a stored trust verdict for a public GitHub repository, with evidence coverage, scanner runs, and score history.",
+      path,
+    };
+  const score = Number(report?.trust_score);
+  const grade = report?.grade && report.grade !== "-" ? report.grade : "";
+  const badge = [
+    grade ? `grade ${grade}` : "",
+    Number.isFinite(score) ? `${Math.round(score)}/100` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return {
+    title: pageTitle(
+      badge
+        ? `${repository} trust verdict — ${badge}`
+        : `${repository} trust verdict`,
+    ),
+    description: [
+      report?.verdict || `Stored trust verdict for ${repository}`,
+      badge ? `(${badge})` : "",
+      "with evidence coverage, scanner runs, and score history.",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    path,
+  };
 }
 
 function normalizeHistory(payload) {

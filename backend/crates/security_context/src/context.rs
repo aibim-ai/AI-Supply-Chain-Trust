@@ -1,6 +1,8 @@
 //! Port of `security_context.py:context_from_report()`.
 //! Builds the full SecurityContext JSON from a trust evaluation report.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 use super::fingerprints::fingerprints_from_report;
@@ -19,12 +21,9 @@ pub fn context_from_report(report: &Value, repo: &str) -> Value {
             "head_sha": metadata(report).get("head_sha").and_then(Value::as_str).unwrap_or("unknown")
         },
         "generated_at": report.get("evaluated_at").and_then(Value::as_str).unwrap_or(""),
-        "commits_scanned": security_intel(report)
-            .get("commit_count")
-            .and_then(Value::as_i64)
-            .or_else(|| metadata(report).get("commit_count").and_then(Value::as_i64))
-            .unwrap_or(0),
-        "commits_flagged": report.get("critical_flags").and_then(Value::as_array).map_or(0, Vec::len),
+        "commits_scanned": commits_scanned(report).unwrap_or(0),
+        "commits_flagged": commits_flagged(report),
+        "policy_flags": report.get("critical_flags").and_then(Value::as_array).map_or(0, Vec::len),
         "archetype": if has_ai_signal(report) { "ai" } else { "repository" },
         "excluded_availability": unavailable_count(report),
         "summary": report.get("verdict").and_then(Value::as_str).unwrap_or("Evidence-backed repository trust context."),
@@ -68,7 +67,7 @@ fn llm_summary(report: &Value) -> Value {
     let rule = json!({
         "fixes": fingerprints_from_report(report).as_array().map_or(0, Vec::len),
         "cves": security_intel(report).get("cves").and_then(Value::as_array).map_or(0, Vec::len),
-        "top_severity": super::top_risks::top_severity_from(&fingerprints_from_report(report)),
+        "top_severity": super::top_risks::top_severity_for_report(report),
         "remediation_coverage": coverage_percent(report)
     });
     ai_supply_chain_trust_llm::tasks::unavailable_decision("synchronous_context_generation", rule)
@@ -110,6 +109,41 @@ fn security_intel(report: &Value) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// Number of commits the history scan walked. `None` means the report carries
+/// no commit count at all, which is different from a recorded count of zero.
+fn commits_scanned(report: &Value) -> Option<i64> {
+    security_intel(report)
+        .get("commit_count")
+        .and_then(Value::as_i64)
+        .or_else(|| metadata(report).get("commit_count").and_then(Value::as_i64))
+}
+
+/// Number of *commits* flagged as security-relevant by the history scan.
+///
+/// This counts distinct fix-commit fingerprints (the ones built from
+/// `security_intel.fix_commits`, which are the only fingerprints carrying a
+/// commit sha). Advisory and OSV fingerprints are not commits and are excluded.
+/// The result can never exceed `commits_scanned`.
+fn commits_flagged(report: &Value) -> i64 {
+    let fingerprints = fingerprints_from_report(report);
+    let mut seen: HashSet<&str> = HashSet::new();
+    for fingerprint in fingerprints.as_array().into_iter().flatten() {
+        if let Some(sha) = fingerprint
+            .get("commit_sha")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|sha| !sha.is_empty())
+        {
+            seen.insert(sha);
+        }
+    }
+    let flagged = seen.len() as i64;
+    match commits_scanned(report) {
+        Some(scanned) => flagged.min(scanned.max(0)),
+        None => flagged,
+    }
+}
+
 fn has_ai_signal(report: &Value) -> bool {
     let metrics = report.get("observed_metrics").and_then(|v| v.as_object());
     metrics
@@ -144,7 +178,7 @@ fn agent_brief(report: &Value, repo: &str) -> String {
     format!("Review {repo} from latest trust evidence ({verdict}, grade {grade}).")
 }
 
-fn known_cves(report: &Value) -> Value {
+pub(crate) fn known_cves(report: &Value) -> Value {
     let intel = security_intel(report);
     let mut rows = Vec::new();
     for advisory in intel
@@ -540,6 +574,173 @@ mod tests {
         assert_eq!(remediation["guarded_sites"], json!(1));
         assert_eq!(remediation["remediated_fixes"], json!(1));
         assert_eq!(remediation["measurable_fixes"], json!(2));
+    }
+
+    /// Shaped like the real ollama/ollama report: a large commit history, many
+    /// known CVEs, no fix commits, and policy findings in `critical_flags`.
+    fn cve_heavy_report() -> Value {
+        let cves = (1..=24)
+            .map(|idx| json!(format!("CVE-2026-{idx:04}")))
+            .collect::<Vec<_>>();
+        json!({
+            "critical_flags": [
+                {"code": "missing_license", "severity": "medium", "message": "No license file."},
+                {"code": "no_branch_protection", "severity": "high", "message": "Default branch unprotected."}
+            ],
+            "observed_metrics": {
+                "metadata": {"commit_count": 1000},
+                "security_intel": {
+                    "commit_count": 1000,
+                    "cves": cves,
+                    "nvd_cves": [
+                        {
+                            "cve_id": "CVE-2026-0001",
+                            "description": "Path traversal in the model pull endpoint.",
+                            "cvss_score": 9.1,
+                            "published": "2026-01-02T00:00:00.000",
+                            "source": "nvd"
+                        },
+                        {
+                            "cve_id": "CVE-2026-0002",
+                            "description": "Denial of service in the chat handler.",
+                            "severity": "MEDIUM",
+                            "cvss_score": 5.3,
+                            "published": "2026-01-03T00:00:00.000",
+                            "source": "nvd"
+                        }
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn top_severity_reflects_known_cves_when_there_are_no_fix_commits() {
+        let report = cve_heavy_report();
+
+        assert_eq!(
+            super::super::top_risks::top_severity_for_report(&report),
+            "critical"
+        );
+
+        let context = context_from_report(&report, "ollama/ollama");
+        assert_eq!(context["known_cves"].as_array().unwrap().len(), 24);
+        assert_eq!(
+            context["llm_summary"]["rule_based_result"]["top_severity"],
+            json!("critical")
+        );
+    }
+
+    #[test]
+    fn top_severity_is_max_across_fingerprints_and_cves() {
+        let report = json!({
+            "observed_metrics": {
+                "security_intel": {
+                    "commit_count": 500,
+                    "fix_commits": [{
+                        "sha": "1111111111", "subject": "fix input validation",
+                        "component": "src/api.go", "vuln_class": "Security Fix",
+                        "cwe": [], "severity": "low", "date": "2026-01-01T00:00:00Z",
+                        "html_url": "https://github.com/example/repo/commit/1111111111"
+                    }],
+                    "nvd_cves": [{
+                        "cve_id": "CVE-2026-0007",
+                        "description": "Remote code execution in the loader.",
+                        "cvss_score": 7.5
+                    }]
+                }
+            }
+        });
+
+        assert_eq!(
+            super::super::top_risks::top_severity_for_report(&report),
+            "high"
+        );
+    }
+
+    #[test]
+    fn top_severity_stays_none_only_when_there_is_no_evidence() {
+        let empty = json!({"observed_metrics": {"security_intel": {}}});
+        assert_eq!(
+            super::super::top_risks::top_severity_for_report(&empty),
+            "none"
+        );
+
+        // Bare CVE ids with no severity or CVSS are evidence, just unrated.
+        let unrated = json!({
+            "observed_metrics": {"security_intel": {"cves": ["CVE-2026-0001"]}}
+        });
+        assert_eq!(
+            super::super::top_risks::top_severity_for_report(&unrated),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn commits_flagged_counts_commits_not_policy_findings() {
+        let report = cve_heavy_report();
+        let context = context_from_report(&report, "ollama/ollama");
+
+        assert_eq!(context["commits_scanned"], json!(1000));
+        // 24 CVEs but zero fix commits => zero flagged commits.
+        assert_eq!(context["commits_flagged"], json!(0));
+        // The two policy findings are preserved under their own honest key.
+        assert_eq!(context["policy_flags"], json!(2));
+    }
+
+    #[test]
+    fn commits_flagged_counts_distinct_fix_commits() {
+        let report = json!({
+            "critical_flags": [{"code": "missing_license", "severity": "medium"}],
+            "observed_metrics": {
+                "security_intel": {
+                    "commit_count": 40,
+                    "fix_commits": [
+                        {"sha": "aaaa111111", "subject": "fix overflow", "component": "src/a.c", "severity": "high"},
+                        {"sha": "bbbb222222", "subject": "fix uaf", "component": "src/b.c", "severity": "high"},
+                        {"sha": "aaaa111111", "subject": "fix overflow", "component": "src/a.c", "severity": "high"}
+                    ],
+                    "github_advisories": [
+                        {"ghsa_id": "GHSA-xxxx-yyyy-zzzz", "cve_id": "CVE-2026-0009", "severity": "critical", "summary": "RCE"}
+                    ]
+                }
+            }
+        });
+
+        let context = context_from_report(&report, "example/repo");
+
+        // 3 fix commits (one duplicate) + 1 advisory fingerprint => 2 commits.
+        assert_eq!(context["fingerprints"].as_array().unwrap().len(), 4);
+        assert_eq!(context["commits_flagged"], json!(2));
+        assert_eq!(context["policy_flags"], json!(1));
+    }
+
+    #[test]
+    fn commits_flagged_never_exceeds_commits_scanned() {
+        let report = json!({
+            "critical_flags": [
+                {"code": "a", "severity": "high"},
+                {"code": "b", "severity": "high"}
+            ],
+            "observed_metrics": {
+                "security_intel": {
+                    "commit_count": 1,
+                    "fix_commits": [
+                        {"sha": "aaaa111111", "subject": "fix one", "component": "src/a.c", "severity": "high"},
+                        {"sha": "bbbb222222", "subject": "fix two", "component": "src/b.c", "severity": "high"}
+                    ]
+                }
+            }
+        });
+
+        let context = context_from_report(&report, "example/repo");
+
+        assert_eq!(context["commits_scanned"], json!(1));
+        assert_eq!(context["commits_flagged"], json!(1));
+        assert!(
+            context["commits_flagged"].as_i64().unwrap()
+                <= context["commits_scanned"].as_i64().unwrap()
+        );
     }
 
     #[test]

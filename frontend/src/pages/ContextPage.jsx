@@ -5,7 +5,9 @@ import { ErrorState } from "../components/ui";
 import { ContextReport } from "../features/security-context/ContextReport";
 import { ScanProgress } from "../features/security-context/ScanProgress";
 import { useAsync } from "../hooks/use-async";
+import { useDocumentMeta } from "../hooks/use-document-meta";
 import { trustApi } from "../lib/api-client";
+import { absoluteUrl, pageTitle, repositoryJsonLd } from "../lib/seo";
 import {
   captureProductEvent,
   createScanAttempt,
@@ -133,6 +135,10 @@ export default function ContextPage() {
       events?.close();
     };
   }, [isEnriching, query.retry, resultQuery.retry]);
+
+  useDocumentMeta(
+    contextMeta(repository, query.data, resultQuery.data, query.status),
+  );
 
   async function queueRescan() {
     const attempt = createScanAttempt(repository, {
@@ -305,6 +311,66 @@ function EnrichingContext({ repository, report, refreshing }) {
       </div>
     </section>
   );
+}
+
+// The repository is known from the route before any request resolves, so the
+// loading title already names it and is only refined — never replaced by a
+// generic title — once the verdict loads.
+function contextMeta(repository, context, report, status) {
+  const url = absoluteUrl(`/r/${repository}`);
+  const trust = context?.context?.trust || context?.trust_decision || {};
+  const grade = pick(trust.grade, report?.grade);
+  const rawScore = trust.score ?? report?.trust_score;
+  const score = Number(rawScore);
+  const hasScore =
+    rawScore !== null && rawScore !== undefined
+      ? Number.isFinite(score)
+      : false;
+  const verdict = pick(trust.label, report?.verdict, context?.summary?.verdict);
+  const action = pick(trust.action, report?.action);
+  const evaluatedAt = pick(
+    context?.generated_at,
+    context?.context?.generated_at,
+    context?.summary?.generated_at,
+    report?.evaluated_at,
+  );
+  const badge = [
+    grade ? `trust grade ${grade}` : "",
+    hasScore ? `${Math.round(score)}/100` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const settled = status !== "loading";
+
+  return {
+    title: pageTitle(
+      badge ? `${repository} — ${badge}` : `${repository} security context`,
+    ),
+    description:
+      settled && verdict
+        ? `${verdict}${badge ? ` (${badge})` : ""} — evidence-backed security context for ${repository}: disclosed CVEs, missing evidence, and ranked review leads.`
+        : `Evidence-backed security context for the public GitHub repository ${repository}: disclosed CVEs, missing evidence, and ranked review leads.`,
+    url,
+    type: "article",
+    jsonLd: repositoryJsonLd({
+      repository,
+      url,
+      description: verdict || undefined,
+      score: hasScore ? score : undefined,
+      grade: grade || undefined,
+      verdict: verdict || undefined,
+      action: action || undefined,
+      evaluatedAt: evaluatedAt || undefined,
+    }),
+  };
+}
+
+function pick(...values) {
+  for (const value of values) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text && text !== "-" && text !== "unknown") return text;
+  }
+  return "";
 }
 
 function percent(value) {

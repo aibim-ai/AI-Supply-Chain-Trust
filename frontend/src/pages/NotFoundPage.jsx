@@ -1,5 +1,19 @@
 import { Link } from "react-router-dom";
+import { useDocumentMeta } from "../hooks/use-document-meta";
+import { pageTitle } from "../lib/seo";
+
 export default function NotFoundPage() {
+  useDocumentMeta({
+    title: pageTitle("Page not found"),
+    description:
+      "This page does not exist. Browse published repository security contexts or scan a public GitHub repository.",
+    path:
+      globalThis.window?.location?.pathname &&
+      globalThis.window.location.pathname !== "/"
+        ? globalThis.window.location.pathname
+        : "/",
+    robots: "noindex, follow",
+  });
   return (
     <section className="shell py-24 text-center">
       <span className="label">404</span>

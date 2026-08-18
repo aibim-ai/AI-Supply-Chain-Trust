@@ -87,6 +87,47 @@ describe("ContextPage", () => {
     );
   });
 
+  it("publishes repository metadata and trust structured data", async () => {
+    api.context.mockResolvedValue({
+      repo: "owner/repo",
+      status: "ready",
+      generated_at: "2026-07-12T01:00:00Z",
+      context: {
+        trust: {
+          score: 72,
+          grade: "B",
+          label: "Review with known gaps",
+          action: "Complete missing evidence",
+        },
+      },
+    });
+    api.result.mockResolvedValue({});
+    renderPage();
+
+    await waitFor(() =>
+      expect(document.title).toBe(
+        "owner/repo — trust grade B 72/100 | AI Supply Chain Trust",
+      ),
+    );
+    expect(
+      document.head.querySelector('link[rel="canonical"]').getAttribute("href"),
+    ).toBe(`${globalThis.window.location.origin}/r/owner/repo`);
+    expect(
+      document.head
+        .querySelector('meta[property="og:description"]')
+        .getAttribute("content"),
+    ).toContain("Review with known gaps");
+    const nodes = document.head.querySelectorAll(
+      'script[type="application/ld+json"]',
+    );
+    expect(nodes).toHaveLength(1);
+    const node = JSON.parse(nodes[0].textContent);
+    expect(node["@type"]).toBe("SoftwareSourceCode");
+    expect(node.codeRepository).toBe("https://github.com/owner/repo");
+    expect(node.subjectOf.reviewRating.ratingValue).toBe(72);
+    expect(node.subjectOf.datePublished).toBe("2026-07-12T01:00:00Z");
+  });
+
   it("tracks a complete context render without exposing the repository", async () => {
     api.context.mockResolvedValue({
       status: "ready",

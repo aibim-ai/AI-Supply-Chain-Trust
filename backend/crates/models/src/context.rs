@@ -65,6 +65,10 @@ pub struct SecurityContext {
     pub generated_at: String,
     pub commits_scanned: i64,
     pub commits_flagged: i64,
+    /// Count of policy findings from the 8-pillar evaluation. Distinct from
+    /// `commits_flagged`, which counts security-relevant commits.
+    #[serde(default)]
+    pub policy_flags: i64,
     pub archetype: String,
     #[serde(default)]
     pub excluded_availability: i64,

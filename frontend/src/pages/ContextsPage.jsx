@@ -4,9 +4,17 @@ import { Link } from "react-router-dom";
 import { ErrorState, PageHeader, PageLoader } from "../components/ui";
 import { HomeActivityList } from "../features/repositories/RepositoryViews";
 import { useAsync } from "../hooks/use-async";
+import { useDocumentMeta } from "../hooks/use-document-meta";
 import { trustApi } from "../lib/api-client";
+import { pageTitle } from "../lib/seo";
 
 export default function ContextsPage() {
+  useDocumentMeta({
+    title: pageTitle("Public repository contexts"),
+    description:
+      "Browse every published security context and queued scan: trust grades, evidence coverage, fixes, and disclosed CVEs for public GitHub repositories.",
+    path: "/contexts",
+  });
   const query = useAsync(async () => {
     const [recent, jobs, stats] = await Promise.allSettled([
       trustApi.recent(250),

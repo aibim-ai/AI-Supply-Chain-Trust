@@ -16,4 +16,7 @@ pub use fingerprints::fingerprints_from_report;
 pub use leads::leads_from_report;
 pub use regression_contracts::regression_contracts_from_report;
 pub use render::{render_context_markdown, render_leads_markdown};
-pub use top_risks::top_risks;
+pub use top_risks::{
+    severity_from_cvss, severity_rank, top_risks, top_severity_for_report, top_severity_from,
+    top_severity_from_parts,
+};

@@ -73,6 +73,11 @@
   .data-table tbody tr {
     @apply transition hover:bg-slate-50 dark:hover:bg-slate-800/60;
   }
+  /* Single wrapper for multi-line cells so the responsive
+     label/content grid below keeps one child in the content column. */
+  .cell-stack {
+    @apply block min-w-0;
+  }
   .app-header {
     @apply sticky top-0 z-40 border-b bg-white/85 backdrop-blur-xl dark:bg-[#0a0a0a]/85;
   }
@@ -4927,7 +4932,8 @@ th {
     white-space: normal;
     overflow-wrap: anywhere;
   }
-  .sc-watch td > .sc-cell-content {
+  .sc-watch td > .sc-cell-content,
+  .data-table td > .cell-stack {
     grid-column: 2;
     min-width: 0;
   }

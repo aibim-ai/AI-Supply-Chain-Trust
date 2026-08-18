@@ -83,7 +83,9 @@ export function buildSearchCandidates({
   suggestions.forEach((candidate) =>
     add({
       repo: typeof candidate.repo === "string" ? candidate.repo : "",
-      score: candidate.score,
+      // /api/v1/suggest mirrors the stored score as `score`; every other scan
+      // API publishes it as `trust_score`. Accept either shape.
+      score: candidate.trust_score ?? candidate.score,
       grade: candidate.grade,
       status: candidate.status,
       summary: candidate.summary,

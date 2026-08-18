@@ -20,8 +20,11 @@ RUN cargo build --release -p ai-supply-chain-trust && \
 # writable cache at runtime, which this read-only, nobody-owned image has no
 # place for).
 FROM golang:1.25-bookworm AS scanner-builder
+# gitleaks moved GitHub organisations but its go.mod still declares the module
+# as github.com/zricethezav/gitleaks/v8 (verified through v8.30.1), so the
+# install path must use the declared module path, not the current repo URL.
 RUN GOBIN=/out go install github.com/ossf/scorecard/v5@v5.3.0 && \
-    GOBIN=/out go install github.com/gitleaks/gitleaks/v8@v8.21.2
+    GOBIN=/out go install github.com/zricethezav/gitleaks/v8@v8.21.2
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim

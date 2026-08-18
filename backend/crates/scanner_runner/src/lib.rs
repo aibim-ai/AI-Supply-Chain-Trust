@@ -1,7 +1,7 @@
 //! Scanner runner — matches `scanner_runner.py` + `scanner_policy.py`.
 //! Executes external CLI security scanners and captures JSON output.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -231,6 +231,36 @@ impl ScannerRunner {
     // -------------------------------------------------------------------
     // Gitleaks: gitleaks detect --source={path} --no-git -f json
     // -------------------------------------------------------------------
+    /// Argument list for the gitleaks working-tree scan.
+    ///
+    /// Two flags here are load-bearing and were verified against gitleaks
+    /// v8.21.2 rather than assumed:
+    ///
+    /// * `--report-path /dev/stdout` — with only `-f json`, gitleaks writes a
+    ///   human-readable log to stderr and *nothing* to stdout. The caller would
+    ///   then see empty output and report every repository as having no secrets,
+    ///   which is a false negative on a security result.
+    /// * `--exit-code 0` — gitleaks exits 1 when it finds leaks, and `run_cmd`
+    ///   treats a non-zero status as a scanner failure. Without this, the scan
+    ///   fails on exactly the repositories that do contain secrets.
+    fn gitleaks_args(source: &str) -> Vec<String> {
+        [
+            "detect",
+            "--source",
+            source,
+            "--no-git",
+            "-f",
+            "json",
+            "--report-path",
+            "/dev/stdout",
+            "--exit-code",
+            "0",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
     async fn run_gitleaks(&self) -> anyhow::Result<(String, String, Option<Value>)> {
         let Some(path) = self.available_source() else {
             return Ok((
@@ -239,19 +269,18 @@ impl ScannerRunner {
                 None,
             ));
         };
+        let args = Self::gitleaks_args(&path);
         let output = run_cmd(
             "gitleaks",
-            &["detect", "--source", &path, "--no-git", "-f", "json"],
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
             ScannerTool::Gitleaks.timeout_seconds(),
             &[],
         )
         .await?;
         if output.trim().is_empty() {
-            return Ok((
-                STATUS_OK.into(),
-                "Gitleaks: no secrets found".into(),
-                Some(json!([])),
-            ));
+            // Reachable only if gitleaks produced no report at all; treat it as a
+            // scanner problem rather than silently claiming the repository is clean.
+            anyhow::bail!("gitleaks produced no report on stdout");
         }
         let json: Value = serde_json::from_str(&output)?;
         let count = json.as_array().map(|a| a.len()).unwrap_or(0);
@@ -706,6 +735,28 @@ fn find_file(root: &str, candidates: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn gitleaks_argv_keeps_the_flags_that_make_its_output_usable() {
+        let args = ScannerRunner::gitleaks_args("/tmp/checkout");
+
+        // Verified against gitleaks v8.21.2: without --report-path the JSON
+        // report never reaches stdout and every repository reads as clean;
+        // without --exit-code 0 the process exits 1 whenever it finds secrets
+        // and the run is recorded as a scanner failure.
+        let report_path = args.iter().position(|a| a == "--report-path");
+        assert!(report_path.is_some(), "missing --report-path: {args:?}");
+        assert_eq!(args[report_path.unwrap() + 1], "/dev/stdout");
+
+        let exit_code = args.iter().position(|a| a == "--exit-code");
+        assert!(exit_code.is_some(), "missing --exit-code: {args:?}");
+        assert_eq!(args[exit_code.unwrap() + 1], "0");
+
+        let source = args.iter().position(|a| a == "--source").unwrap();
+        assert_eq!(args[source + 1], "/tmp/checkout");
+        assert!(args.contains(&"--no-git".to_string()));
+        assert!(args.contains(&"json".to_string()));
+    }
 
     #[test]
     fn all_scanners_registered() {

@@ -459,6 +459,10 @@ pub async fn serve(
             "/api/v1/queue/rescan",
             axum::routing::post(queue_rescan_handler),
         )
+        .route(
+            "/api/v1/ops/requeue-all",
+            axum::routing::post(requeue_all_handler),
+        )
         .route("/api/v1/admin/discrepancy", get(discrepancy_handler))
         .route("/api/v1/admin/consistency", get(consistency_handler))
         .route("/sitemap.xml", get(sitemap_xml))
@@ -2126,6 +2130,31 @@ struct RescanBody {
     repo: String,
     priority: Option<i64>,
 }
+#[derive(Deserialize)]
+struct RequeueAllBody {
+    limit: Option<i64>,
+}
+
+/// Re-queue the whole public inventory. Worker-token protected and deliberately
+/// exempt from the public per-requester rescan limit, which exists to stop an
+/// anonymous visitor flooding the queue and makes a fleet-wide sweep impossible
+/// through `/api/v1/queue/rescan` (10 requests per requester per day).
+async fn requeue_all_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<axum::extract::Json<RequeueAllBody>>,
+) -> Result<Json<Value>, ApiError> {
+    require_worker_token(&state, &headers)?;
+    let limit = body
+        .and_then(|axum::extract::Json(body)| body.limit)
+        .unwrap_or(50_000);
+    state
+        .service
+        .enqueue_full_inventory_rescan(limit)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
 async fn queue_rescan_handler(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -3161,6 +3190,58 @@ mod tests {
         assert_eq!(cycles[0]["queued_count"], json!(1));
         assert_eq!(cycles[0]["config"]["topics"], json!(["mock-topic"]));
         assert_eq!(db.scan_jobs_recent(1)[0]["repo"], json!("owner/mock-repo"));
+    }
+
+    #[tokio::test]
+    async fn requeue_all_requires_the_worker_token_and_skips_the_public_limit() {
+        // The public rescan limit is 10 per requester per day, so a fleet-wide
+        // sweep is impossible through /api/v1/queue/rescan. This route exists to
+        // do that job, which makes its auth the only thing between an anonymous
+        // caller and the entire scan queue.
+        let db = Arc::new(Database::open_memory().unwrap());
+        for repo in ["a/one", "b/two", "c/three"] {
+            db.insert_report(&json!({
+                "repo": repo, "evaluated_at": "2026-08-01", "trust_score": 50.0,
+                "grade": "C", "verdict": "v", "action": "a", "next_review_date": "2026-09-01",
+                "coverage": "", "critical_flags": [], "pillar_scores": {},
+                "scanner_runs": [], "observed_metrics": {}, "scoring_version": "v1"
+            }))
+            .unwrap();
+        }
+        let mut state = test_state(db, "https://example.test");
+
+        // No token configured: the route must stay shut rather than open.
+        let closed = requeue_all_handler(State(state.clone()), HeaderMap::new(), None)
+            .await
+            .expect_err("must reject when no worker token is configured");
+        assert_eq!(closed.status, StatusCode::UNAUTHORIZED);
+
+        state.worker_token =
+            Some("6fb46f7a92742970166379ed5195e79c4493a7cc5664280c039cfd4095ba5faf".into());
+
+        let anonymous = requeue_all_handler(State(state.clone()), HeaderMap::new(), None)
+            .await
+            .expect_err("must reject an unauthenticated caller");
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert("authorization", HeaderValue::from_static("Bearer nope"));
+        let rejected = requeue_all_handler(State(state.clone()), wrong, None)
+            .await
+            .expect_err("must reject a wrong token");
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer worker-secret"),
+        );
+        let response = requeue_all_handler(State(state), headers, None)
+            .await
+            .expect("a valid worker token should be accepted");
+        assert_eq!(response.0["examined"], json!(3));
+        assert_eq!(response.0["queued"], json!(3));
+        assert_eq!(response.0["failed"], json!(0));
     }
 
     #[tokio::test]

@@ -1195,6 +1195,46 @@ impl Service {
             "target_version": ai_supply_chain_trust_security_context::LIVE_SECURITY_CONTEXT_VERSION
         }))
     }
+    /// Re-queue every repository in the public inventory, regardless of the
+    /// security-context version its stored report carries.
+    ///
+    /// A scoring or pipeline fix does not rewrite stored reports, so correcting
+    /// published verdicts requires scanning each repository again. The existing
+    /// version-keyed sweep above cannot do that job on its own: bumping
+    /// `LIVE_SECURITY_CONTEXT_VERSION` is also rule 2 of the evidence gate, so it
+    /// invalidates every stored context at once and each repository page reads as
+    /// "evidence missing" until its rescan lands. This enqueues the same work
+    /// without invalidating anything, so pages keep serving their current context
+    /// and flip to corrected data as their own scan completes.
+    ///
+    /// Jobs go to the background lane at the lowest priority so a visitor's own
+    /// scan is never queued behind this sweep.
+    pub fn enqueue_full_inventory_rescan(&self, limit: i64) -> Result<Value, String> {
+        let rows = self.db.recent_scans(limit.clamp(1, 50_000));
+        let mut queued = Vec::new();
+        let mut failed = Vec::new();
+
+        for repo in rows
+            .iter()
+            .filter_map(|row| row.get("repo").and_then(Value::as_str))
+        {
+            match self.db.enqueue_rescan_with_lane(repo, -100, "background") {
+                // A repository already sitting in the queue is not an error: the
+                // sweep is meant to be safe to run twice.
+                Ok(job_id) => queued.push(json!({"repo": repo, "job_id": job_id})),
+                Err(error) => failed.push(json!({"repo": repo, "error": error.to_string()})),
+            }
+        }
+
+        Ok(json!({
+            "examined": rows.len(),
+            "queued": queued.len(),
+            "failed": failed.len(),
+            "jobs": queued,
+            "errors": failed
+        }))
+    }
+
     pub async fn run_progressive_scan(&self, repo: &str) -> Result<(i64, Value), String> {
         let job_id = self
             .db
